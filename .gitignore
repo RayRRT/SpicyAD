@@ -1,0 +1,43 @@
+# Build outputs
+bin/
+obj/
+[Bb]uild/
+[Dd]ebug/
+x64/
+x86/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.csproj.user
+
+# NuGet
+packages/
+*.nupkg
+project.lock.json
+project.assets.json
+
+# Attack output files (generated during testing)
+*.kirbi
+*.pfx
+*.pem
+*_backup_*.json
+kerberoast_*.txt
+asreproast_*.txt
+smb_signing_*.txt
+*.bin
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+SpicyAD_*.txt
+
+# Test files
+TEST_RESULTS.md

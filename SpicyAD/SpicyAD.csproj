@@ -1,0 +1,47 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <PublishSingleFile>false</PublishSingleFile>
+  </PropertyGroup>
+
+  <!-- Embed interop DLLs as resources -->
+  <ItemGroup>
+    <EmbeddedResource Include="Interop.CERTCLILib.dll">
+      <LogicalName>Interop.CERTCLILib.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Interop.CERTENROLLLib.dll">
+      <LogicalName>Interop.CERTENROLLLib.dll</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.DirectoryServices" Version="8.0.0" />
+    <PackageReference Include="System.DirectoryServices.AccountManagement" Version="8.0.0" />
+    <PackageReference Include="System.DirectoryServices.Protocols" Version="8.0.0" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="8.0.0" />
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.0.2" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="System.IO.Compression" Version="4.3.0" />
+    <PackageReference Include="Costura.Fody" Version="5.7.0">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.IdentityModel">
+      <HintPath>C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.IdentityModel.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Management" />
+    <Reference Include="Interop.CERTCLILib">
+      <HintPath>Interop.CERTCLILib.dll</HintPath>
+    </Reference>
+    <Reference Include="Interop.CERTENROLLLib">
+      <HintPath>Interop.CERTENROLLLib.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
