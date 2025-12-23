@@ -163,6 +163,9 @@ namespace SpicyAD
                     cmdPassword = arg.Substring(10);
                 else if (arg.StartsWith("/dns:", StringComparison.OrdinalIgnoreCase))
                     cmdDns = arg.Substring(5);
+                else if (arg.Equals("/ldaps", StringComparison.OrdinalIgnoreCase) ||
+                         arg.Equals("/ssl", StringComparison.OrdinalIgnoreCase))
+                    AuthContext.SetLdaps(true);
             }
 
             // Filter out connection flags from args
@@ -172,7 +175,9 @@ namespace SpicyAD
                 !a.StartsWith("/dcip:", StringComparison.OrdinalIgnoreCase) &&
                 !a.StartsWith("/user:", StringComparison.OrdinalIgnoreCase) &&
                 !a.StartsWith("/password:", StringComparison.OrdinalIgnoreCase) &&
-                !a.StartsWith("/dns:", StringComparison.OrdinalIgnoreCase)
+                !a.StartsWith("/dns:", StringComparison.OrdinalIgnoreCase) &&
+                !a.Equals("/ldaps", StringComparison.OrdinalIgnoreCase) &&
+                !a.Equals("/ssl", StringComparison.OrdinalIgnoreCase)
             ).ToArray();
 
             // Set credentials if provided via command line
@@ -935,6 +940,7 @@ namespace SpicyAD
             Console.WriteLine("  /user:<user>       - Username (DOMAIN\\user or user)");
             Console.WriteLine("  /password:<pwd>    - Password for authentication");
             Console.WriteLine("  /dns:<ip>          - Custom DNS server (defaults to DC IP)");
+            Console.WriteLine("  /ldaps, /ssl       - Use LDAPS (SSL/TLS, port 636)");
             Console.WriteLine("\nENUMERATION COMMANDS:");
             Console.WriteLine("  domain-info         - Get domain information");
             Console.WriteLine("  enum-dcs           - Enumerate domain controllers");

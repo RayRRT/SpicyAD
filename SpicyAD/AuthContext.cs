@@ -17,6 +17,24 @@ namespace SpicyAD
         public static string CredentialDomain { get; private set; }
         public static bool UseAlternateCredentials { get; private set; }
         public static bool IsDomainJoined { get; private set; }
+        public static bool UseLdaps { get; private set; }
+
+        /// <summary>
+        /// Get the LDAP protocol prefix (always LDAP:// - SSL is handled via AuthenticationTypes)
+        /// </summary>
+        public static string LdapProtocol => "LDAP://";
+
+        /// <summary>
+        /// Enable or disable LDAPS (SSL/TLS on port 636)
+        /// </summary>
+        public static void SetLdaps(bool enabled)
+        {
+            UseLdaps = enabled;
+            if (enabled)
+            {
+                Console.WriteLine("[*] Using LDAPS (SSL/TLS, port 636)");
+            }
+        }
 
         
         /// Initialize - detect domain context (fast, no network calls)
@@ -25,6 +43,7 @@ namespace SpicyAD
         {
             UseAlternateCredentials = false;
             IsDomainJoined = false;
+            UseLdaps = false;
             DcIp = null;
             DomainName = null;
 
@@ -91,7 +110,7 @@ namespace SpicyAD
                 OutputHelper.Verbose($"[*] Auto-detecting domain from DC: {dcIp}");
 
                 // Connect to RootDSE (usually allows anonymous or authenticated access)
-                string rootDsePath = $"LDAP://{dcIp}/RootDSE";
+                string rootDsePath = $"{LdapProtocol}{dcIp}/RootDSE";
                 DirectoryEntry rootDse;
 
                 if (UseAlternateCredentials && !string.IsNullOrEmpty(Username) && !string.IsNullOrEmpty(Password))
@@ -301,7 +320,7 @@ namespace SpicyAD
 
                 UseAlternateCredentials = true;
                 Console.WriteLine($"[+] Switched to alternate credentials: {CredentialDomain}\\{Username}");
-                OutputHelper.Verbose($"[*] LDAP Path will use: LDAP://{DomainName}");
+                OutputHelper.Verbose($"[*] LDAP Path will use: {LdapProtocol}{DomainName}");
                 OutputHelper.Verbose($"[*] Credentials: {CredentialDomain}\\{Username} (password length: {Password?.Length ?? 0})");
             }
             else
@@ -329,48 +348,80 @@ namespace SpicyAD
         
         public static DirectoryEntry GetRootDSE()
         {
-            // If domain-joined and no alternate credentials, let Windows handle it
-            if (IsDomainJoined && !UseAlternateCredentials && string.IsNullOrEmpty(DcIp))
+            // If domain-joined and no alternate credentials and no LDAPS, let Windows handle it
+            if (IsDomainJoined && !UseAlternateCredentials && string.IsNullOrEmpty(DcIp) && !UseLdaps)
             {
                 OutputHelper.Verbose("[*] LDAP Path: LDAP://RootDSE (domain-joined, current user)");
                 return new DirectoryEntry("LDAP://RootDSE");
             }
 
             string server = GetLdapServer();
-            string ldapPath = string.IsNullOrEmpty(server) ? "LDAP://RootDSE" : $"LDAP://{server}/RootDSE";
+
+            // LDAPS requires explicit server - use domain name if no DC IP specified
+            if (UseLdaps && string.IsNullOrEmpty(server))
+            {
+                server = DomainName;
+            }
+
+            string ldapPath = string.IsNullOrEmpty(server) ? $"{LdapProtocol}RootDSE" : $"{LdapProtocol}{server}/RootDSE";
 
             OutputHelper.Verbose($"[*] LDAP Path: {ldapPath}" + (UseAlternateCredentials ? $" (as {Username})" : ""));
 
+            DirectoryEntry entry;
             if (UseAlternateCredentials)
             {
-                return new DirectoryEntry(ldapPath, Username, Password);
+                entry = new DirectoryEntry(ldapPath, Username, Password);
             }
             else
             {
-                return new DirectoryEntry(ldapPath);
+                entry = new DirectoryEntry(ldapPath);
             }
+
+            // For LDAPS, set authentication type
+            if (UseLdaps)
+            {
+                entry.AuthenticationType = AuthenticationTypes.SecureSocketsLayer | AuthenticationTypes.Secure;
+            }
+
+            return entry;
         }
 
         public static DirectoryEntry GetDirectoryEntry()
         {
-            // If domain-joined and no alternate credentials and no explicit DC, let Windows handle it
-            if (IsDomainJoined && !UseAlternateCredentials && string.IsNullOrEmpty(DcIp))
+            // If domain-joined and no alternate credentials and no explicit DC and no LDAPS, let Windows handle it
+            if (IsDomainJoined && !UseAlternateCredentials && string.IsNullOrEmpty(DcIp) && !UseLdaps)
             {
                 return new DirectoryEntry($"LDAP://{DomainName}");
             }
 
             string server = GetLdapServer();
-            string ldapPath = string.IsNullOrEmpty(server) ? $"LDAP://{DomainName}" : $"LDAP://{server}";
 
+            // LDAPS requires explicit server - use domain name if no DC IP specified
+            if (UseLdaps && string.IsNullOrEmpty(server))
+            {
+                server = DomainName;
+            }
+
+            string ldapPath = string.IsNullOrEmpty(server) ? $"{LdapProtocol}{DomainName}" : $"{LdapProtocol}{server}";
+
+            DirectoryEntry entry;
             if (UseAlternateCredentials)
             {
                 // Use just username - domain is inferred from LDAP path
-                return new DirectoryEntry(ldapPath, Username, Password);
+                entry = new DirectoryEntry(ldapPath, Username, Password);
             }
             else
             {
-                return new DirectoryEntry(ldapPath);
+                entry = new DirectoryEntry(ldapPath);
             }
+
+            // For LDAPS, set authentication type
+            if (UseLdaps)
+            {
+                entry.AuthenticationType = AuthenticationTypes.SecureSocketsLayer | AuthenticationTypes.Secure;
+            }
+
+            return entry;
         }
 
         public static DirectoryEntry GetDirectoryEntry(string path)
@@ -379,6 +430,7 @@ namespace SpicyAD
             if (path.StartsWith("LDAP://", StringComparison.OrdinalIgnoreCase))
             {
                 string afterProtocol = path.Substring(7);
+
                 // Check if path doesn't have a server (starts with CN=, DC=, OU=)
                 if (afterProtocol.StartsWith("CN=", StringComparison.OrdinalIgnoreCase) ||
                     afterProtocol.StartsWith("DC=", StringComparison.OrdinalIgnoreCase) ||
@@ -396,16 +448,25 @@ namespace SpicyAD
                 }
             }
 
-            OutputHelper.Verbose($"[*] LDAP Path: {path}");
+            OutputHelper.Verbose($"[*] LDAP Path: {path}" + (UseLdaps ? " (SSL)" : ""));
 
+            DirectoryEntry entry;
             if (UseAlternateCredentials)
             {
-                return new DirectoryEntry(path, Username, Password);
+                entry = new DirectoryEntry(path, Username, Password);
             }
             else
             {
-                return new DirectoryEntry(path);
+                entry = new DirectoryEntry(path);
             }
+
+            // For LDAPS, set authentication type
+            if (UseLdaps)
+            {
+                entry.AuthenticationType = AuthenticationTypes.SecureSocketsLayer | AuthenticationTypes.Secure;
+            }
+
+            return entry;
         }
 
         public static PrincipalContext GetPrincipalContext()
