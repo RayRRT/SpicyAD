@@ -27,13 +27,47 @@ namespace SpicyAD
         /// <summary>
         /// Enable or disable LDAPS (SSL/TLS on port 636)
         /// </summary>
-        public static void SetLdaps(bool enabled)
+        public static void SetLdaps(bool enabled, bool silent = false)
         {
             UseLdaps = enabled;
-            if (enabled)
+            if (enabled && !silent)
             {
                 Console.WriteLine("[*] Using LDAPS (SSL/TLS, port 636)");
             }
+        }
+
+        /// <summary>
+        /// Auto-detect if LDAPS is available (port 636 open)
+        /// </summary>
+        public static bool AutoDetectLdaps()
+        {
+            if (string.IsNullOrEmpty(DomainName) && string.IsNullOrEmpty(DcIp))
+                return false;
+
+            string target = DcIp ?? DomainName;
+
+            try
+            {
+                using (var client = new System.Net.Sockets.TcpClient())
+                {
+                    var result = client.BeginConnect(target, 636, null, null);
+                    bool success = result.AsyncWaitHandle.WaitOne(1000); // 1 second timeout
+                    if (success)
+                    {
+                        client.EndConnect(result);
+                        UseLdaps = true;
+                        Console.WriteLine("[+] LDAPS available (port 636) - using secure connection");
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                // LDAPS not available
+            }
+
+            Console.WriteLine("[*] Using LDAP (port 389)");
+            return false;
         }
 
         
@@ -60,6 +94,9 @@ namespace SpicyAD
 
                     Console.WriteLine($"[*] Current User: {Username}");
                     Console.WriteLine($"[*] Domain: {DomainName}");
+
+                    // Auto-detect LDAPS availability
+                    AutoDetectLdaps();
                 }
                 else
                 {

@@ -838,11 +838,13 @@ namespace SpicyAD
                 Console.WriteLine("║            SETTINGS                  ║");
                 Console.WriteLine("╠══════════════════════════════════════╣");
                 
+                string ldapMode = AuthContext.UseLdaps ? "LDAPS (636)" : "LDAP (389)";
                 Console.WriteLine("║  [1] Configure Target/Credentials    ║");
                 Console.WriteLine("║  [2] Show Current Context            ║");
                 Console.WriteLine("║  [3] Reset to Current User           ║");
                 Console.WriteLine("║  [4] Toggle Verbose Mode             ║");
-                
+                Console.WriteLine($"║  [5] Toggle LDAP/LDAPS [{ldapMode,-11}] ║");
+
                 Console.WriteLine("║  [0] Back                            ║");
                 
                 Console.WriteLine("╚══════════════════════════════════════╝");
@@ -868,6 +870,10 @@ namespace SpicyAD
                         OutputHelper.ToggleVerbose();
                         Console.WriteLine($"[+] Verbose mode: {(OutputHelper.IsVerbose ? "ON" : "OFF")}");
                         break;
+                    case "5":
+                        AuthContext.SetLdaps(!AuthContext.UseLdaps);
+                        Console.WriteLine($"[+] Now using: {(AuthContext.UseLdaps ? "LDAPS (port 636)" : "LDAP (port 389)")}");
+                        break;
                     default:
                         Console.WriteLine("[!] Invalid option");
                         break;
@@ -886,6 +892,7 @@ namespace SpicyAD
             Console.WriteLine($"    DNS Server: {AuthContext.DnsServer ?? "Not set"}");
             Console.WriteLine($"    Username: {AuthContext.Username ?? "Not set"}");
             Console.WriteLine($"    Use Alt Creds: {AuthContext.UseAlternateCredentials}");
+            Console.WriteLine($"    LDAP Mode: {(AuthContext.UseLdaps ? "LDAPS (port 636)" : "LDAP (port 389)")}");
             Console.WriteLine($"    Verbose Mode: {OutputHelper.IsVerbose}");
         }
         #endregion

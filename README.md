@@ -79,6 +79,8 @@
 
 SpicyAD is a C# Active Directory penetration testing tool designed for authorized security assessments. It combines multiple AD attack techniques into a single, easy-to-use tool with both interactive and command-line interfaces.
 
+**Secure by default:** SpicyAD automatically detects and uses LDAPS (port 636) when available, falling back to LDAP (port 389) if not. This can be toggled manually via `/ldaps` flag or in the Settings menu.
+
 | Category | Capabilities |
 |----------|--------------|
 | **Enumeration** | Domain info, DCs, users, computers, shares (SYSVOL/NETLOGON/all), trusts, delegations (Unconstrained/Constrained/RBCD), LAPS, certificate templates (ESC1-4, ESC8), **BloodHound Ingestor** |
