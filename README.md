@@ -248,6 +248,10 @@ BloodHound Ingestor - Collect AD data for BloodHound CE analysis. Generates JSON
 
 # Only certificate services
 .\SpicyAD.exe bloodhound /collection:certservices
+
+# With LDAPS (SSL/TLS, port 636)
+.\SpicyAD.exe /ldaps bloodhound
+.\SpicyAD.exe /ldaps bloodhound /collection:all
 ```
 
 **Non-Domain-Joined:**
@@ -255,6 +259,9 @@ BloodHound Ingestor - Collect AD data for BloodHound CE analysis. Generates JSON
 .\SpicyAD.exe /domain:evilcorp.net /dc-ip:10.10.10.10 /user:admin /password:P@ssw0rd bloodhound
 .\SpicyAD.exe /domain:evilcorp.net /dc-ip:10.10.10.10 /user:admin /password:P@ssw0rd bloodhound /collection:all
 .\SpicyAD.exe /domain:evilcorp.net /dc-ip:10.10.10.10 /user:admin /password:P@ssw0rd bloodhound /collection:dconly /stealth
+
+# With LDAPS (SSL/TLS)
+.\SpicyAD.exe /domain:evilcorp.net /dc-ip:10.10.10.10 /user:admin /password:P@ssw0rd /ldaps bloodhound
 ```
 
 **Reflection:**
@@ -262,8 +269,14 @@ BloodHound Ingestor - Collect AD data for BloodHound CE analysis. Generates JSON
 [Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("bloodhound")
 [Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("bloodhound", "/collection:all")
 
+# With LDAPS
+[Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("/ldaps", "bloodhound")
+
 # Non-Domain-Joined
 [Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("/domain:evilcorp.net", "/dc-ip:10.10.10.10", "/user:admin", "/password:P@ssw0rd", "bloodhound")
+
+# Non-Domain-Joined with LDAPS
+[Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("/domain:evilcorp.net", "/dc-ip:10.10.10.10", "/user:admin", "/password:P@ssw0rd", "/ldaps", "bloodhound")
 ```
 
 **Output:** ZIP file containing JSON files for import into BloodHound CE.
