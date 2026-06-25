@@ -405,7 +405,13 @@ namespace SpicyAD
 
                         foreach (string arg in args.Skip(1))
                         {
-                            if (arg.StartsWith("/password:", StringComparison.OrdinalIgnoreCase))
+                            // /spray-pass: is the spray target password. It must NOT collide with
+                            // the global /password: connection flag (which is stripped earlier),
+                            // so spraying with alternate creds is possible. /password: still works
+                            // when using integrated auth (no connection /password: present).
+                            if (arg.StartsWith("/spray-pass:", StringComparison.OrdinalIgnoreCase))
+                                sprayPassword = arg.Substring(12);
+                            else if (arg.StartsWith("/password:", StringComparison.OrdinalIgnoreCase))
                                 sprayPassword = arg.Substring(10);
                             else if (arg.StartsWith("/delay:", StringComparison.OrdinalIgnoreCase))
                                 int.TryParse(arg.Substring(7), out sprayDelay);
@@ -413,8 +419,9 @@ namespace SpicyAD
 
                         if (string.IsNullOrEmpty(sprayPassword))
                         {
-                            Console.WriteLine("[!] Usage: spray /password:<password> [/delay:<ms>]");
-                            Console.WriteLine("[!] Example: spray /password:Summer2024! /delay:1000");
+                            Console.WriteLine("[!] Usage: spray /spray-pass:<password> [/delay:<ms>]");
+                            Console.WriteLine("[!] Example: spray /spray-pass:Summer2024! /delay:1000");
+                            Console.WriteLine("[!] Use /spray-pass: (not /password:) when also passing connection /user: and /password:.");
                         }
                         else
                         {
