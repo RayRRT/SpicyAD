@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.DirectoryServices;
 using System.DirectoryServices.AccountManagement;
@@ -721,8 +721,17 @@ namespace SpicyAD
         {
             try
             {
-                // Build AS-REQ with PA-ENC-TIMESTAMP (pre-authentication)
-                byte[] asReq = BuildAsReqWithPreAuth(domain, username, password);
+                // First, ask the KDC what salt/etype/iterations this principal actually uses.
+                // This is a no-password probe (does not touch badPwdCount) and makes AES pre-auth
+                // reliable for renamed principals, machine accounts, and non-default realms.
+                EtypeInfo info = GetEtypeInfo(kdcHost, domain, username);
+                if (info != null)
+                {
+                    OutputHelper.Verbose($"[*] {username}: KDC etype={info.Etype} salt={(info.Salt ?? "<default>")} iter={(info.Iterations?.ToString() ?? "4096")}");
+                }
+
+                // Build AS-REQ with PA-ENC-TIMESTAMP (pre-authentication) using the real params
+                byte[] asReq = BuildAsReqWithPreAuth(domain, username, password, info);
 
                 // Send to KDC
                 byte[] response = SendToKdc(kdcHost, 88, asReq);
@@ -742,9 +751,40 @@ namespace SpicyAD
             }
         }
 
+        /// Build a probe AS-REQ with NO PA-ENC-TIMESTAMP (only PA-PAC-REQUEST). The KDC will
+        /// reject it with PREAUTH_REQUIRED but include PA-ETYPE-INFO2, which tells us the real
+        /// salt / etype / iteration count for this principal. No password is sent, so this does
+        /// not affect badPwdCount.
+        private static byte[] BuildAsReqNoPreAuth(string realm, string username)
+        {
+            byte[] paPacRequest = BuildPaPacRequest(true);
+            byte[] reqBody = BuildKdcReqBody(realm, username);
+
+            List<byte> kdcReq = new List<byte>();
+            kdcReq.AddRange(BuildContextTag(1, BuildInteger(5)));   // pvno
+            kdcReq.AddRange(BuildContextTag(2, BuildInteger(10)));  // msg-type AS-REQ
+
+            // padata [3] with only PA-PAC-REQUEST (no enc-timestamp)
+            List<byte> padataSeq = new List<byte>();
+            padataSeq.AddRange(paPacRequest);
+            kdcReq.AddRange(BuildContextTag(3, BuildSequence(padataSeq.ToArray())));
+
+            kdcReq.AddRange(BuildContextTag(4, reqBody)); // req-body
+
+            byte[] kdcReqBytes = BuildSequence(kdcReq.ToArray());
+
+            List<byte> asReq = new List<byte>();
+            asReq.Add(0x6A); // APPLICATION 10
+            asReq.AddRange(BuildLength(kdcReqBytes.Length));
+            asReq.AddRange(kdcReqBytes);
+            return asReq.ToArray();
+        }
+
         
-        /// Build AS-REQ with PA-ENC-TIMESTAMP pre-authentication
-        private static byte[] BuildAsReqWithPreAuth(string domain, string username, string password)
+        /// Build AS-REQ with PA-ENC-TIMESTAMP pre-authentication.
+        /// If <paramref name="info"/> is supplied (from PA-ETYPE-INFO2) its etype, salt and
+        /// iteration count are used; otherwise we fall back to AES256 with the default salt.
+        private static byte[] BuildAsReqWithPreAuth(string domain, string username, string password, EtypeInfo info = null)
         {
             string realm = domain.ToUpper();
 
@@ -752,12 +792,37 @@ namespace SpicyAD
             DateTime now = DateTime.UtcNow;
             byte[] timestamp = BuildPaEncTimestamp(now);
 
-            // Encrypt timestamp with user's key (derived from password)
-            byte[] userKey = DeriveKeyFromPassword(password, realm, username);
-            byte[] encryptedTimestamp = RC4Encrypt(userKey, timestamp, 1); // key usage 1 for PA-ENC-TIMESTAMP
+            byte[] encryptedTimestamp;
+            int paEtype;
 
-            // Build PA-ENC-TIMESTAMP
-            byte[] paEncTimestamp = BuildPaData(2, encryptedTimestamp); // PA-ENC-TIMESTAMP = 2
+            // Decide the etype: trust the KDC's advertised value if we have it.
+            int chosenEtype = info != null ? info.Etype : KerberosAES.ETYPE_AES256;
+
+            if (chosenEtype == 23) // RC4-HMAC
+            {
+                byte[] rc4Key = DeriveKeyFromPassword(password, realm, username);
+                encryptedTimestamp = RC4Encrypt(rc4Key, timestamp, 1); // key usage 1
+                paEtype = 23;
+            }
+            else
+            {
+                // AES128 (17) or AES256 (18)
+                paEtype = (chosenEtype == KerberosAES.ETYPE_AES128)
+                    ? KerberosAES.ETYPE_AES128 : KerberosAES.ETYPE_AES256;
+
+                // Use the KDC-supplied salt if present, else the default REALM+principal.
+                string salt = (info != null && !string.IsNullOrEmpty(info.Salt))
+                    ? info.Salt : (realm + username);
+
+                int iterations = (info != null && info.Iterations.HasValue && info.Iterations.Value > 0)
+                    ? info.Iterations.Value : 4096;
+
+                byte[] aesKey = KerberosAES.StringToKey(password, salt, paEtype, iterations);
+                encryptedTimestamp = KerberosAES.Encrypt(aesKey, timestamp, 1, paEtype); // key usage 1
+            }
+
+            // Build PA-ENC-TIMESTAMP with the matching etype in the EncryptedData wrapper
+            byte[] paEncTimestamp = BuildPaData(2, encryptedTimestamp, paEtype); // PA-ENC-TIMESTAMP = 2
 
             // Build PA-PAC-REQUEST
             byte[] paPacRequest = BuildPaPacRequest(true);
@@ -818,7 +883,7 @@ namespace SpicyAD
             return BuildSequence(paEncTs.ToArray());
         }
 
-        private static byte[] BuildPaData(int paDataType, byte[] paDataValue)
+        private static byte[] BuildPaData(int paDataType, byte[] paDataValue, int etype = 23)
         {
             // PA-DATA ::= SEQUENCE {
             //     padata-type [1] INTEGER,
@@ -836,8 +901,10 @@ namespace SpicyAD
                 //     etype [0] INTEGER,
                 //     cipher [2] OCTET STRING
                 // }
+                // The etype here MUST match the algorithm used to encrypt the timestamp,
+                // otherwise the KDC returns PREAUTH_FAILED for everyone.
                 List<byte> encData = new List<byte>();
-                encData.AddRange(BuildContextTag(0, BuildInteger(23))); // RC4-HMAC
+                encData.AddRange(BuildContextTag(0, BuildInteger(etype)));
                 encData.AddRange(BuildContextTag(2, BuildOctetString(paDataValue)));
 
                 padata.AddRange(BuildContextTag(2, BuildOctetString(BuildSequence(encData.ToArray()))));
@@ -1068,6 +1135,142 @@ namespace SpicyAD
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Salt / etype / iteration info advertised by the KDC in PA-ETYPE-INFO2.
+        /// Null fields mean "use the default" (default salt = REALM+principal, default iter = 4096).
+        /// </summary>
+        internal class EtypeInfo
+        {
+            public int Etype;
+            public string Salt;        // null => caller builds default salt
+            public int? Iterations;    // null => 4096
+        }
+
+        /// <summary>
+        /// Send a probe AS-REQ with NO pre-auth to elicit PA-ETYPE-INFO2 from the KDC, then
+        /// parse out the preferred etype, salt, and iteration count. This avoids guessing the
+        /// salt (which breaks for renamed principals, machine accounts, or non-default realms).
+        /// Returns the best (highest-strength) AES entry, or null if none was advertised.
+        /// </summary>
+        private static EtypeInfo GetEtypeInfo(string kdcHost, string domain, string username)
+        {
+            try
+            {
+                byte[] probe = BuildAsReqNoPreAuth(domain.ToUpper(), username);
+                byte[] resp = SendToKdc(kdcHost, 88, probe);
+                if (resp == null || resp.Length == 0)
+                    return null;
+                return ParseEtypeInfo2(resp);
+            }
+            catch (Exception ex)
+            {
+                OutputHelper.Verbose($"[!] GetEtypeInfo error for {username}: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Walk a KRB-ERROR's e-data looking for PA-ETYPE-INFO2 (padata-type 19). Each
+        /// ETYPE-INFO2-ENTRY ::= SEQUENCE { etype [0] Int32, salt [1] KerberosString OPTIONAL,
+        /// s2kparams [2] OCTET STRING OPTIONAL }. We pick AES256 > AES128 > (else first).
+        /// This is a tolerant scan rather than a full ASN.1 decoder, matching the style of the
+        /// existing error-code scan in this file.
+        /// </summary>
+        private static EtypeInfo ParseEtypeInfo2(byte[] resp)
+        {
+            // Locate the PA-ETYPE-INFO2 padata-type marker: INTEGER 19 == 02 01 13
+            // inside a padata-type [1] (0xA1) context tag: A1 03 02 01 13
+            EtypeInfo best = null;
+            for (int i = 0; i < resp.Length - 5; i++)
+            {
+                if (resp[i] == 0xA1 && resp[i + 1] == 0x03 &&
+                    resp[i + 2] == 0x02 && resp[i + 3] == 0x01 && resp[i + 4] == 0x13)
+                {
+                    // The following padata-value [2] (0xA2) holds an OCTET STRING wrapping
+                    // SEQUENCE OF ETYPE-INFO2-ENTRY. Scan forward for entries.
+                    var entries = ScanEtypeInfo2Entries(resp, i + 5);
+                    foreach (var e in entries)
+                    {
+                        if (best == null) best = e;
+                        else if (e.Etype == KerberosAES.ETYPE_AES256) best = e;          // prefer AES256
+                        else if (e.Etype == KerberosAES.ETYPE_AES128 &&
+                                 best.Etype != KerberosAES.ETYPE_AES256) best = e;        // else AES128
+                    }
+                    break;
+                }
+            }
+            return best;
+        }
+
+        // Tolerant scan: find each ETYPE-INFO2-ENTRY SEQUENCE (0x30) after the padata marker,
+        // pull etype from [0] (A0 .. 02 01 XX) and optional salt from [1] (A1 .. 1B/GeneralString
+        // or 04/OCTET). Stops at the next padata-type tag or end of buffer.
+        private static List<EtypeInfo> ScanEtypeInfo2Entries(byte[] resp, int start)
+        {
+            var list = new List<EtypeInfo>();
+            int i = start;
+            int guard = 0;
+            while (i < resp.Length - 4 && guard++ < 64)
+            {
+                // entry begins with SEQUENCE
+                if (resp[i] == 0x30)
+                {
+                    int entryLen = resp[i + 1];
+                    int entryEnd = Math.Min(resp.Length, i + 2 + entryLen);
+                    int j = i + 2;
+                    int etype = -1;
+                    string salt = null;
+                    int? iters = null;
+
+                    while (j < entryEnd - 2)
+                    {
+                        if (resp[j] == 0xA0 && resp[j + 1] >= 0x03 &&
+                            resp[j + 2] == 0x02 && resp[j + 3] == 0x01)
+                        {
+                            etype = resp[j + 4];
+                            j += 5;
+                        }
+                        else if (resp[j] == 0xA1) // salt [1]
+                        {
+                            int saltCtxLen = resp[j + 1];
+                            // inner string: tag (0x1B GeneralString or 0x04 OCTET STRING), len, bytes
+                            int strTag = resp[j + 2];
+                            int strLen = resp[j + 3];
+                            if ((strTag == 0x1B || strTag == 0x04) && j + 4 + strLen <= entryEnd)
+                                salt = Encoding.UTF8.GetString(resp, j + 4, strLen);
+                            j += 2 + saltCtxLen;
+                        }
+                        else if (resp[j] == 0xA2) // s2kparams [2] -> 4-byte big-endian iteration count
+                        {
+                            int pCtxLen = resp[j + 1];
+                            int octTag = resp[j + 2];
+                            int octLen = resp[j + 3];
+                            if (octTag == 0x04 && octLen == 4 && j + 4 + 4 <= entryEnd)
+                            {
+                                iters = (resp[j + 4] << 24) | (resp[j + 5] << 16) |
+                                        (resp[j + 6] << 8) | resp[j + 7];
+                            }
+                            j += 2 + pCtxLen;
+                        }
+                        else
+                        {
+                            j++;
+                        }
+                    }
+
+                    if (etype != -1)
+                        list.Add(new EtypeInfo { Etype = etype, Salt = salt, Iterations = iters });
+
+                    i = entryEnd;
+                }
+                else
+                {
+                    i++;
+                }
+            }
+            return list;
         }
 
         private static KerberosAuthResult ParseKdcResponse(byte[] response)
