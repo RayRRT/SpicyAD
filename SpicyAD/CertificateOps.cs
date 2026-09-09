@@ -568,10 +568,27 @@ namespace SpicyAD
 
         public static void EnumerateVulnerableCertificates()
         {
+            EnumerateVulnerableCertificates(false);
+        }
+
+        /// <summary>
+        /// Enumerate certificate templates and flag ESC1..ESC4 (+ ESC8 web enrollment).
+        /// A template is only reported as vulnerable when at least one CA publishes it
+        /// (its CN appears in the CA's certificateTemplates attribute); unpublished
+        /// templates cannot be enrolled through and are false positives. Pass
+        /// includeUnpublished=true to also list unpublished templates that would be
+        /// vulnerable if published (audit view).
+        /// </summary>
+        public static void EnumerateVulnerableCertificates(bool includeUnpublished)
+        {
             Console.WriteLine("[*] Enumerating Certificate Templates for Vulnerabilities...\n");
             Console.WriteLine("[*] Checking ESC1, ESC2, ESC3, ESC4, and ESC8...\n");
             Console.WriteLine("[*] NOTE: Only showing vulnerabilities exploitable by low-privileged groups\n");
             Console.WriteLine("          (Domain Users, Authenticated Users, Domain Computers, Everyone)\n");
+            if (includeUnpublished)
+                Console.WriteLine("[*] includeUnpublished=true - also reporting unpublished templates (not enrollable)\n");
+            else
+                Console.WriteLine("[*] Unpublished templates (not enabled on any CA) are HIDDEN. Use /all to include them.\n");
 
             try
             {
@@ -580,6 +597,11 @@ namespace SpicyAD
                 string configNC = rootDSE.Properties["configurationNamingContext"][0].ToString();
 
                 Console.WriteLine($"[*] Configuration NC: {configNC}\n");
+
+                // Build map: templateCN (lowercased) -> list of CA names that publish it.
+                // This is the ground truth for whether a template is actually enrollable.
+                Dictionary<string, List<string>> publishedBy = BuildPublishedTemplatesMap(configNC);
+                Console.WriteLine($"[*] Templates published across all CAs: {publishedBy.Count}\n");
 
                 // Search for certificate templates - like Certify does
                 DirectoryEntry pkiEntry = AuthContext.GetDirectoryEntry($"LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,{configNC}");
@@ -604,6 +626,7 @@ namespace SpicyAD
                 Console.WriteLine($"[*] Found {templates.Count} certificate templates\n");
 
                 int esc1Count = 0, esc2Count = 0, esc3Count = 0, esc4Count = 0;
+                int skippedUnpublished = 0;
 
                 foreach (SearchResult template in templates)
                 {
@@ -611,6 +634,18 @@ namespace SpicyAD
                         template.Properties["cn"][0].ToString() : "Unknown";
                     string displayName = template.Properties["displayname"].Count > 0 ?
                         template.Properties["displayname"][0].ToString() : cn;
+
+                    // Check publication status. A template not published on any CA
+                    // cannot be enrolled through, so any ESC1-4 flag on it is a
+                    // false positive.  Skip by default unless includeUnpublished.
+                    List<string> publishedOn;
+                    bool isPublished = publishedBy.TryGetValue(cn.ToLowerInvariant(), out publishedOn);
+                    if (!isPublished && !includeUnpublished)
+                    {
+                        skippedUnpublished++;
+                        OutputHelper.Verbose($"[DEBUG] Skipping unpublished template: {cn}");
+                        continue;
+                    }
 
                     // Get security descriptor directly from SearchResult (like Certify)
                     ActiveDirectorySecurity adSecurity = null;
@@ -681,9 +716,14 @@ namespace SpicyAD
 
                     if (vulns.Count > 0)
                     {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"[!] VULNERABLE: {displayName} ({cn})");
+                        Console.ForegroundColor = isPublished ? ConsoleColor.Yellow : ConsoleColor.DarkGray;
+                        string pubTag = isPublished ? "[PUBLISHED]" : "[UNPUBLISHED - not exploitable]";
+                        Console.WriteLine($"[!] VULNERABLE {pubTag}: {displayName} ({cn})");
                         Console.ResetColor();
+                        if (isPublished)
+                        {
+                            Console.WriteLine($"    Published on CA(s): {string.Join(", ", publishedOn)}");
+                        }
 
                         foreach (var vuln in vulns)
                         {
@@ -745,17 +785,68 @@ namespace SpicyAD
                 Console.WriteLine("\n========================================");
                 Console.WriteLine("[*] SUMMARY");
                 Console.WriteLine("========================================");
-                Console.WriteLine($"    Total templates scanned: {templates.Count}");
-                Console.WriteLine($"    ESC1 (Supply Subject):   {esc1Count}");
-                Console.WriteLine($"    ESC2 (Any Purpose):      {esc2Count}");
-                Console.WriteLine($"    ESC3 (Request Agent):    {esc3Count}");
-                Console.WriteLine($"    ESC4 (Template Hijack):  {esc4Count}");
+                Console.WriteLine($"    Total templates scanned:      {templates.Count}");
+                Console.WriteLine($"    Published templates:          {publishedBy.Count}");
+                if (!includeUnpublished)
+                    Console.WriteLine($"    Unpublished (hidden):         {skippedUnpublished}  (use /all to show)");
+                Console.WriteLine($"    ESC1 (Supply Subject):        {esc1Count}");
+                Console.WriteLine($"    ESC2 (Any Purpose):           {esc2Count}");
+                Console.WriteLine($"    ESC3 (Request Agent):         {esc3Count}");
+                Console.WriteLine($"    ESC4 (Template Hijack):       {esc4Count}");
+                Console.WriteLine("    (counts include unpublished only when /all is set)");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[!] Error: {ex.Message}");
                 OutputHelper.Verbose($"[!] Stack Trace: {ex.StackTrace}");
             }
+        }
+
+        /// <summary>
+        /// Build a map (templateCN -> list of CA names) of every template
+        /// currently published on any Enterprise CA in the forest. Templates
+        /// missing from this map cannot be enrolled through and any ESC1-4
+        /// finding on them is a false positive.
+        /// </summary>
+        private static Dictionary<string, List<string>> BuildPublishedTemplatesMap(string configNC)
+        {
+            var map = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                DirectoryEntry caContainer = AuthContext.GetDirectoryEntry(
+                    $"LDAP://CN=Enrollment Services,CN=Public Key Services,CN=Services,{configNC}");
+                DirectorySearcher caSearcher = new DirectorySearcher(caContainer);
+                caSearcher.Filter = "(objectClass=pKIEnrollmentService)";
+                caSearcher.PropertiesToLoad.Add("cn");
+                caSearcher.PropertiesToLoad.Add("dNSHostName");
+                caSearcher.PropertiesToLoad.Add("certificateTemplates");
+
+                foreach (SearchResult ca in caSearcher.FindAll())
+                {
+                    string caName = ca.Properties["cn"].Count > 0
+                        ? ca.Properties["cn"][0].ToString()
+                        : "Unknown-CA";
+                    if (ca.Properties["certificateTemplates"].Count == 0) continue;
+                    foreach (var t in ca.Properties["certificateTemplates"])
+                    {
+                        string name = t?.ToString();
+                        if (string.IsNullOrWhiteSpace(name)) continue;
+                        string key = name.ToLowerInvariant();
+                        if (!map.TryGetValue(key, out var list))
+                        {
+                            list = new List<string>();
+                            map[key] = list;
+                        }
+                        if (!list.Contains(caName)) list.Add(caName);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[!] Warning: could not enumerate published templates: {ex.Message}");
+                Console.WriteLine("    Falling back to reporting ALL templates as potentially vulnerable.");
+            }
+            return map;
         }
 
         // New methods that work directly with SearchResult (like Certify)
