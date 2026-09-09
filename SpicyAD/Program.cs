@@ -394,8 +394,26 @@ namespace SpicyAD
 
                 // Attacks
                 case "kerberoast":
+                {
+                    // Etype strategy flags:
+                    //   (default)         -> Auto: try RC4 first (LSA downgrade), fall back to AES/legacy
+                    //   /rc4only          -> only RC4, skip SPNs that refuse it
+                    //   /aes-only         -> only AES, quiet against MDI "encryption downgrade" alerts
+                    //   /no-downgrade     -> legacy KerberosRequestorSecurityToken only (whatever LSA gives)
+                    foreach (string a in args.Skip(1))
+                    {
+                        string flag = a.TrimStart('/', '-').ToLowerInvariant();
+                        if (flag == "rc4only" || flag == "rc4")
+                            KerberosHelper.EtypeMode = KerberoastEtypeMode.Rc4Only;
+                        else if (flag == "aes-only" || flag == "aesonly" || flag == "aes")
+                            KerberosHelper.EtypeMode = KerberoastEtypeMode.AesOnly;
+                        else if (flag == "no-downgrade" || flag == "nodowngrade")
+                            KerberosHelper.EtypeMode = KerberoastEtypeMode.NoDowngrade;
+                    }
+                    Console.WriteLine($"[*] Kerberoast etype mode: {KerberosHelper.EtypeMode}");
                     KerberosAttacks.Kerberoast();
                     break;
+                }
                 case "asreproast":
                     KerberosAttacks.ASREPRoast();
                     break;
