@@ -271,7 +271,13 @@ namespace SpicyAD
                     break;
                 case "enum-vulns":
                 case "find-vulns":
-                    CertificateOps.EnumerateVulnerableCertificates();
+                    {
+                        bool includeUnpublished = args.Skip(1).Any(a =>
+                            a.Equals("/all", StringComparison.OrdinalIgnoreCase) ||
+                            a.Equals("--all", StringComparison.OrdinalIgnoreCase) ||
+                            a.Equals("/include-unpublished", StringComparison.OrdinalIgnoreCase));
+                        CertificateOps.EnumerateVulnerableCertificates(includeUnpublished);
+                    }
                     break;
                 case "enum-certs":
                 case "find-certs":
